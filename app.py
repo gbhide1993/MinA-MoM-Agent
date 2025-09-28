@@ -26,6 +26,8 @@ LANGUAGE = os.getenv("LANGUAGE")  # e.g. "hi" for Hindi
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
 # Validate essential env vars at import/start time
+def debug_print(*args):
+    print(*args)
 missing = []
 if not TWILIO_SID: missing.append("TWILIO_ACCOUNT_SID")
 if not TWILIO_TOKEN: missing.append("TWILIO_AUTH_TOKEN")
@@ -100,8 +102,7 @@ def get_or_create_user(phone):
     return user
 
 
-def debug_print(*args):
-    print(*args)
+
 
 def download_file(url, ext=".ogg"):
     tmpdir = tempfile.gettempdir()
