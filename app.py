@@ -5,6 +5,8 @@ import time
 import tempfile
 import traceback
 import requests
+import sqlite3
+from datetime import datetime, timedelta
 from flask import Flask, request
 from dotenv import load_dotenv
 from twilio.rest import Client
@@ -23,7 +25,80 @@ LANGUAGE = os.getenv("LANGUAGE")  # e.g. "hi" for Hindi
 
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
+# Validate essential env vars at import/start time
+missing = []
+if not TWILIO_SID: missing.append("TWILIO_ACCOUNT_SID")
+if not TWILIO_TOKEN: missing.append("TWILIO_AUTH_TOKEN")
+if not TWILIO_FROM: missing.append("TWILIO_WHATSAPP_FROM")
+if not OPENAI_KEY: missing.append("OPENAI_API_KEY")
+if missing:
+    debug_print("WARNING: Missing environment variables:", missing)
+else:
+    debug_print("All required environment variables present. TWILIO_FROM =", TWILIO_FROM)
+
+
 # --- Helpers ---
+
+DB_PATH = "users.db"
+
+def init_db():
+    """Initialize SQLite DB if not exists."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            phone TEXT PRIMARY KEY,
+            credits_remaining REAL,
+            subscription_active INTEGER,
+            subscription_expiry TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_user(phone):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT phone, credits_remaining, subscription_active, subscription_expiry FROM users WHERE phone=?", (phone,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "phone": row[0],
+            "credits_remaining": row[1],
+            "subscription_active": bool(row[2]),
+            "subscription_expiry": row[3]
+        }
+    return None
+
+def save_user(user):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO users (phone, credits_remaining, subscription_active, subscription_expiry)
+        VALUES (?, ?, ?, ?)
+    """, (
+        user["phone"],
+        user["credits_remaining"],
+        int(user["subscription_active"]),
+        user["subscription_expiry"]
+    ))
+    conn.commit()
+    conn.close()
+
+def get_or_create_user(phone):
+    user = get_user(phone)
+    if not user:
+        # new user → give 30 free minutes
+        user = {
+            "phone": phone,
+            "credits_remaining": 30.0,
+            "subscription_active": False,
+            "subscription_expiry": None
+        }
+        save_user(user)
+    return user
+
 
 def debug_print(*args):
     print(*args)
@@ -138,7 +213,22 @@ def call_llm_for_minutes_and_bullets(transcript, model="gpt-4o-mini", max_tokens
         return parse_json_from_text(text)
 
 def send_whatsapp(to_whatsapp, body):
-    twilio_client.messages.create(body=body, from_=TWILIO_FROM, to=to_whatsapp)
+    """Send a WhatsApp message via Twilio, with guard for empty recipient and error logging."""
+    if not to_whatsapp:
+        debug_print("send_whatsapp skipped: empty 'to_whatsapp'. Body:", body)
+        return None
+    if not TWILIO_FROM:
+        debug_print("send_whatsapp skipped: TWILIO_FROM is not set. Body:", body)
+        return None
+    try:
+        msg = twilio_client.messages.create(body=body, from_=TWILIO_FROM, to=to_whatsapp)
+        debug_print("Twilio message sent:", getattr(msg, "sid", "<no-sid>"))
+        return msg
+    except Exception as e:
+        # Log the full exception but do not raise (we don't want the webhook to 500 because of a send failure)
+        debug_print("Twilio send failed:", repr(e))
+        return None
+
 
 def format_minutes_for_whatsapp(result: dict) -> str:
     """Format the parsed JSON meeting minutes into a readable WhatsApp message."""
@@ -192,10 +282,18 @@ def format_minutes_for_whatsapp(result: dict) -> str:
 
 @app.route("/twilio-webhook", methods=["POST"])
 def twilio_webhook():
+
     try:
         num_media = int(request.values.get("NumMedia", 0))
         sender = request.values.get("From")
-        debug_print("Incoming from:", sender, "NumMedia:", num_media)
+        body_text = (request.values.get("Body") or "").strip()
+
+        # If From is missing, log keys and return success (Twilio expects 200/204)
+        if not sender:
+            debug_print("Webhook received without 'From'. Keys:", list(request.values.keys()))
+            return ("", 204)
+
+        debug_print("Incoming from:", sender, "NumMedia:", num_media, "Body:", body_text)
 
         if num_media > 0:
             media_url = request.values.get("MediaUrl0")
@@ -209,7 +307,6 @@ def twilio_webhook():
             result = call_llm_for_minutes_and_bullets(transcript)
             formatted_message = format_minutes_for_whatsapp(result)
             send_whatsapp(sender, formatted_message)
-
         else:
             send_whatsapp(sender, "Hi 👋 — send me a voice note and I'll create structured minutes.")
 
@@ -221,5 +318,7 @@ def twilio_webhook():
         return (str(e), 500)
 
 if __name__ == "__main__":
+    init_db()  # make sure users.db exists
     debug_print("Starting Flask app on port 5000")
     app.run(port=5000, debug=True)
+
