@@ -10,18 +10,10 @@ from flask import Flask, request
 from twilio.rest import Client
 from requests.exceptions import HTTPError, RequestException
 from dotenv import load_dotenv
-from pydub import AudioSegment
+from mutagen import File 
 load_dotenv()
 
-import os
-import ffmpeg_downloader as ffdl
 
-# download ffmpeg binary if not present
-if not os.path.exists(ffdl.get_ffmpeg_bin()):
-    ffdl.download_ffmpeg(version="6.1")  # downloads and caches binary
-
-# Configure pydub to use this ffmpeg
-AudioSegment.converter = ffdl.get_ffmpeg_bin()
 
 from payments import create_payment_link_for_phone, verify_razorpay_webhook, handle_webhook_event
 
@@ -89,10 +81,12 @@ def download_file(url, ext=".ogg"):
 def get_audio_duration_seconds(path):
     """
     Return duration in seconds for given audio file path.
-    
+    Uses mutagen to extract metadata, works with mp3, m4a, ogg, etc.
     """
-    audio = AudioSegment.from_file(path)
-    return len(audio) / 1000.0
+    audio = File(path)
+    if audio is None or not hasattr(audio, 'info'):
+        raise ValueError("Unsupported audio format or corrupted file")
+    return audio.info.length
 
 def transcribe_with_whisper(filepath, model="whisper-1", language=None, max_retries=4):
     """
