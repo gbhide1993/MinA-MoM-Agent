@@ -65,18 +65,28 @@ def create_payment_link_for_phone(phone, amount_in_rupees=499, purpose="MinA sub
         "reference_id": link.get("reference_id")
     }
 
+
 def verify_razorpay_webhook(payload_body: bytes, header_signature: str) -> bool:
     """
-    Verify Razorpay webhook signature using HMAC SHA256 and the webhook secret.
-    Razorpay docs: signature = base64(HMAC_SHA256(body, webhook_secret))
+    Use Razorpay SDK's utility function to verify webhook signature.
+    Requires RAZORPAY_WEBHOOK_SECRET to be set in env.
     """
     if not RAZORPAY_WEBHOOK_SECRET:
-        # no secret configured - fail safe
+        # Missing secret -> can't verify
         return False
-    computed_hmac = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), payload_body, hashlib.sha256).digest()
-    computed_signature = base64.b64encode(computed_hmac).decode()
-    # header_signature typically contains the signature string
-    return hmac.compare_digest(computed_signature, header_signature)
+
+    try:
+        client = get_client()
+        # The SDK expects the payload as a bytes-like or str; pass raw bytes.
+        # This will raise an Exception if verification fails.
+        client.utility.verify_webhook_signature(payload_body, header_signature, RAZORPAY_WEBHOOK_SECRET)
+        return True
+    except Exception as e:
+        # Verification failed -> log and return False
+        # Optionally: debug/log e
+        # print("Razorpay webhook verify failed:", e)
+        return False
+
 
 def handle_webhook_event(event_json: dict):
     """
