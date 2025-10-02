@@ -5,12 +5,40 @@ import time
 import tempfile
 import traceback
 import requests
-import sqlite3
 from datetime import datetime, timedelta
 from flask import Flask, request
-from dotenv import load_dotenv
 from twilio.rest import Client
 from requests.exceptions import HTTPError, RequestException
+from dotenv import load_dotenv
+from pydub import AudioSegment
+load_dotenv()
+
+import os
+import ffmpeg_downloader as ffdl
+
+# download ffmpeg binary if not present
+if not os.path.exists(ffdl.get_ffmpeg_bin()):
+    ffdl.download_ffmpeg(version="6.1")  # downloads and caches binary
+
+# Configure pydub to use this ffmpeg
+AudioSegment.converter = ffdl.get_ffmpeg_bin()
+
+from payments import create_payment_link_for_phone, verify_razorpay_webhook, handle_webhook_event
+
+
+from db import (
+    init_db,
+    get_or_create_user,
+    deduct_minutes,
+    get_remaining_minutes,
+    set_subscription_active,
+    record_payment,
+    save_user
+)
+
+# Initialize DB
+init_db()
+
 
 # Load .env
 load_dotenv()
@@ -39,70 +67,6 @@ else:
     debug_print("All required environment variables present. TWILIO_FROM =", TWILIO_FROM)
 
 
-# --- Helpers ---
-
-DB_PATH = "users.db"
-
-def init_db():
-    """Initialize SQLite DB if not exists."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            phone TEXT PRIMARY KEY,
-            credits_remaining REAL,
-            subscription_active INTEGER,
-            subscription_expiry TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def get_user(phone):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT phone, credits_remaining, subscription_active, subscription_expiry FROM users WHERE phone=?", (phone,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            "phone": row[0],
-            "credits_remaining": row[1],
-            "subscription_active": bool(row[2]),
-            "subscription_expiry": row[3]
-        }
-    return None
-
-def save_user(user):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        INSERT OR REPLACE INTO users (phone, credits_remaining, subscription_active, subscription_expiry)
-        VALUES (?, ?, ?, ?)
-    """, (
-        user["phone"],
-        user["credits_remaining"],
-        int(user["subscription_active"]),
-        user["subscription_expiry"]
-    ))
-    conn.commit()
-    conn.close()
-
-def get_or_create_user(phone):
-    user = get_user(phone)
-    if not user:
-        # new user → give 30 free minutes
-        user = {
-            "phone": phone,
-            "credits_remaining": 30.0,
-            "subscription_active": False,
-            "subscription_expiry": None
-        }
-        save_user(user)
-    return user
-
-
-
 
 def download_file(url, ext=".ogg"):
     tmpdir = tempfile.gettempdir()
@@ -121,6 +85,14 @@ def download_file(url, ext=".ogg"):
                 f.write(chunk)
     debug_print("Saved media to:", filename)
     return filename
+
+def get_audio_duration_seconds(path):
+    """
+    Return duration in seconds for given audio file path.
+    
+    """
+    audio = AudioSegment.from_file(path)
+    return len(audio) / 1000.0
 
 def transcribe_with_whisper(filepath, model="whisper-1", language=None, max_retries=4):
     """
