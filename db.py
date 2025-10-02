@@ -13,7 +13,9 @@ def get_conn():
     return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
 
 def init_db():
+    """Create tables and helpful indexes if they don't exist."""
     with get_conn() as conn, conn.cursor() as cur:
+        # users table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             phone TEXT PRIMARY KEY,
@@ -24,6 +26,7 @@ def init_db():
             razorpay_customer_id TEXT
         )
         """)
+        # payments table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             id SERIAL PRIMARY KEY,
@@ -35,7 +38,12 @@ def init_db():
             created_at TIMESTAMP
         )
         """)
+        # indexes (idempotent with IF NOT EXISTS)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_phone ON payments (phone)")
+        # create a unique index on razorpay_payment_id to prevent duplicates
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_razorpay_payment_id ON payments (razorpay_payment_id)")
         conn.commit()
+
 
 def get_user(phone):
     with get_conn() as conn, conn.cursor() as cur:
