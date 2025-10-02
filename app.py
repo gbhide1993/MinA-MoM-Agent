@@ -33,7 +33,6 @@ init_db()
 
 
 # Load .env
-load_dotenv()
 app = Flask(__name__)
 
 # Env variables
@@ -262,12 +261,76 @@ def twilio_webhook():
 
         debug_print("Incoming from:", sender, "NumMedia:", num_media, "Body:", body_text)
 
+
         if num_media > 0:
             media_url = request.values.get("MediaUrl0")
             media_type = request.values.get("MediaContentType0", "")
             ext = ".ogg" if "ogg" in media_type or "opus" in media_type else ".mp3"
             filename = download_file(media_url, ext)
 
+            # --- compute audio duration ---
+            try:
+                duration_seconds = get_audio_duration_seconds(filename)
+            except Exception as e:
+                debug_print("Failed to compute audio duration:", e)
+                send_whatsapp(sender, "Sorry — couldn't determine audio length. Please try a shorter clip.")
+                return ("", 204)
+
+            minutes = float(duration_seconds) / 60.0
+
+            # Ensure user record exists and check credits/subscription (Postgres helpers)
+            user = get_or_create_user(sender)
+            is_premium = bool(user.get("subscription_active"))
+            remaining = get_remaining_minutes(sender)
+
+            # Optional: expire subscription if expiry passed (if you store subscription_expiry)
+            try:
+                exp = user.get("subscription_expiry")
+                if exp:
+                    from datetime import datetime
+                    expiry_dt = datetime.fromisoformat(exp) if isinstance(exp, str) else exp
+                    if expiry_dt and datetime.utcnow() > expiry_dt:
+                        user["subscription_active"] = False
+                        user["subscription_expiry"] = None
+                        save_user(user)
+                        is_premium = False
+                        remaining = get_remaining_minutes(sender)
+            except Exception:
+                pass
+
+            # If not premium, enforce free minutes
+            if not is_premium:
+                if remaining <= 0:
+                    # create and send a payment link
+                    try:
+                        pl = create_payment_link_for_phone(sender, amount_in_rupees=499)
+                        payment_link = pl.get("short_url")
+                    except Exception as e:
+                        debug_print("Payment link creation failed:", e)
+                        payment_link = os.getenv("FALLBACK_PAYMENT_URL", "https://your-website.example/subscribe")
+                    send_whatsapp(sender, f"⚠️ You have used your free 30 minutes. Subscribe for ₹499/month to continue: {payment_link}")
+                    return ("", 204)
+                if remaining < minutes:
+                    try:
+                        pl = create_payment_link_for_phone(sender, amount_in_rupees=499)
+                        payment_link = pl.get("short_url")
+                    except Exception as e:
+                        debug_print("Payment link creation failed:", e)
+                        payment_link = os.getenv("FALLBACK_PAYMENT_URL", "https://your-website.example/subscribe")
+                    send_whatsapp(sender, f"This recording is {minutes:.1f} min but you have only {remaining:.1f} free minutes left. Subscribe: {payment_link}")
+                    return ("", 204)
+
+            # Deduct minutes for non-premium
+            if not is_premium:
+                try:
+                    new_remaining = deduct_minutes(sender, minutes)
+                    debug_print(f"Deducted {minutes:.2f} minutes from {sender}, remaining {new_remaining:.2f}")
+                except Exception as e:
+                    debug_print("Failed to deduct minutes:", e)
+                    # continue but warn user
+                    send_whatsapp(sender, "Warning: couldn't update your usage record. Proceeding to process audio anyway.")
+
+            # Proceed to transcription + LLM
             transcript = transcribe_with_whisper(filename, language=LANGUAGE)
             debug_print("Transcript:", transcript[:200])
 
@@ -287,26 +350,23 @@ def twilio_webhook():
 # ---------------- Razorpay Webhook ----------------
 @app.route("/razorpay-webhook", methods=["POST"])
 def razorpay_webhook():
-    """
-    Handle incoming Razorpay webhook events.
-    Verifies signature using RAZORPAY_WEBHOOK_SECRET,
-    then processes the event (activates subscription, updates DB).
-    """
-    payload = request.get_data()
-    signature = request.headers.get("X-Razorpay-Signature", "")
+    raw = request.get_data()
+    hdr = request.headers.get("X-Razorpay-Signature", "")
+    print("DEBUG — header signature:", hdr)
+    print("DEBUG — raw body (first 300 bytes):", raw[:300])
 
-    # Verify webhook signature
-    if not verify_razorpay_webhook(payload, signature):
+    # 🔑 FIX: decode raw bytes to string
+    payload_str = raw.decode("utf-8")
+
+    if not verify_razorpay_webhook(payload_str, hdr):
         return ("Signature mismatch", 400)
 
-    # Parse JSON safely
     try:
         event_json = request.get_json(force=True)
     except Exception as e:
         print("Invalid Razorpay webhook JSON:", e)
         return ("Invalid JSON", 400)
 
-    # Process event (payments.py -> handle_webhook_event)
     res = handle_webhook_event(event_json)
     print("Razorpay webhook handled:", res)
 
@@ -314,8 +374,9 @@ def razorpay_webhook():
 
 
 
+
+
 if __name__ == "__main__":
-    init_db()  # make sure users.db exists
     debug_print("Starting Flask app on port 5000")
     app.run(port=5000, debug=True)
 
