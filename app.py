@@ -284,6 +284,36 @@ def twilio_webhook():
             send_whatsapp(sender, f"Sorry — failed to process audio. Error: {str(e)[:200]}")
         return (str(e), 500)
 
+# ---------------- Razorpay Webhook ----------------
+@app.route("/razorpay-webhook", methods=["POST"])
+def razorpay_webhook():
+    """
+    Handle incoming Razorpay webhook events.
+    Verifies signature using RAZORPAY_WEBHOOK_SECRET,
+    then processes the event (activates subscription, updates DB).
+    """
+    payload = request.get_data()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+
+    # Verify webhook signature
+    if not verify_razorpay_webhook(payload, signature):
+        return ("Signature mismatch", 400)
+
+    # Parse JSON safely
+    try:
+        event_json = request.get_json(force=True)
+    except Exception as e:
+        print("Invalid Razorpay webhook JSON:", e)
+        return ("Invalid JSON", 400)
+
+    # Process event (payments.py -> handle_webhook_event)
+    res = handle_webhook_event(event_json)
+    print("Razorpay webhook handled:", res)
+
+    return ("OK", 200)
+
+
+
 if __name__ == "__main__":
     init_db()  # make sure users.db exists
     debug_print("Starting Flask app on port 5000")
