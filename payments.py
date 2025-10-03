@@ -105,106 +105,103 @@ def verify_razorpay_webhook(payload_body: str, header_signature: str) -> bool:
         return False
 
 
+# payments.py — replace handle_webhook_event with this
+
 def handle_webhook_event(event_json: dict):
     """
-    Called after webhook signature verified. Update DB accordingly.
-    Expects events like 'payment_link.paid' or 'payment.captured'.
-    Returns a dict describing what happened for logging.
+    Idempotent webhook handler.
+    - Upserts payment record for razorpay_payment_id.
+    - Activates subscription only when status transitions into a 'paid/captured' state.
+    - Returns a dict describing the result for logging.
     """
     try:
         event = event_json.get("event")
         data = event_json.get("payload", {})
 
-        # Handle payment_link.paid and similar events
-        if event in ("payment_link.paid", "payment_link.payment_paid", "payment.captured", "payment.authorized"):
-            # Try to locate payment entity
-            payment_entity = None
-            link_entity = None
+        # We focus on payment_link.paid and payment.captured and related events.
+        if event not in ("payment_link.paid", "payment_link.payment_paid", "payment.captured", "payment.authorized", "payment.failed"):
+            return {"status": "ignored", "event": event}
 
-            # Common payload structure
-            if isinstance(data.get("payment"), dict):
-                payment_entity = data.get("payment", {}).get("entity")
-            if isinstance(data.get("payment_link"), dict):
-                link_entity = data.get("payment_link", {}).get("entity")
+        # Extract payment entity
+        payment_entity = None
+        if isinstance(data.get("payment"), dict):
+            payment_entity = data.get("payment", {}).get("entity")
+        # fallback scan
+        if not payment_entity:
+            for val in data.values():
+                if isinstance(val, dict) and isinstance(val.get("entity"), dict):
+                    ent = val["entity"]
+                    if ent.get("id") and ent.get("status"):
+                        payment_entity = ent
+                        break
 
-            # Fallback scanning
-            if not payment_entity:
-                for key, val in data.items():
-                    if isinstance(val, dict) and val.get("entity") and isinstance(val["entity"], dict):
-                        ent = val["entity"]
-                        # Heuristic: payment entity usually has 'status' and 'id'
-                        if ent.get("status") and ent.get("id"):
-                            payment_entity = ent
-                            break
+        if not payment_entity:
+            print("handle_webhook_event: no payment entity found in payload")
+            return {"status": "no_payment_entity", "event": event}
 
-            # If we have a payment entity, extract fields
-            if payment_entity:
-                razorpay_payment_id = payment_entity.get("id")
-                amount = payment_entity.get("amount")
-                status = payment_entity.get("status")
-                contact = payment_entity.get("contact") or payment_entity.get("customer_id")
+        razorpay_payment_id = payment_entity.get("id")
+        amount = payment_entity.get("amount")
+        status = (payment_entity.get("status") or "").lower()
+        contact = payment_entity.get("contact") or payment_entity.get("customer_id") or None
 
-                # Try to find phone from payments table by razorpay_payment_id
-                phone = None
-                try:
-                    with get_conn() as conn, conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT phone FROM payments WHERE razorpay_payment_id=%s LIMIT 1",
-                            (razorpay_payment_id,)
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            # row is likely a dict from RealDictCursor
-                            if isinstance(row, dict):
-                                phone = row.get("phone")
-                            else:
-                                # tuple fallback
-                                phone = row[0]
-                except Exception as e:
-                    print("handle_webhook_event: DB lookup failed:", e, traceback.format_exc())
+        # Normalize phone: prefer whatsapp:+<number>
+        phone = None
+        if contact:
+            # contact may be '919xxxxxxxx'
+            phone = f"whatsapp:{contact}" if not str(contact).startswith("whatsapp:") else contact
 
-                # fallback to contact field if necessary
-                if not phone and contact:
-                    # ensure contact is numeric phone like 919xxxx
-                    phone = "whatsapp:" + str(contact)
+        # ------------- DB: fetch existing payment if any -------------
+        existing = None
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT razorpay_payment_id, status, phone FROM payments WHERE razorpay_payment_id=%s LIMIT 1", (razorpay_payment_id,))
+                existing = cur.fetchone()
+                # existing could be dict (RealDictCursor) or tuple
+        except Exception as e:
+            print("handle_webhook_event: DB lookup failed:", e)
 
+        prev_status = None
+        if existing:
+            if isinstance(existing, dict):
+                prev_status = (existing.get("status") or "").lower()
                 if not phone:
-                    # can't determine which user to credit; log and return
-                    print("handle_webhook_event: could not determine phone for payment id:", razorpay_payment_id)
-                    # Still record payment row with unknown phone so you can reconcile later
-                    try:
-                        record_payment(phone=None, razorpay_payment_id=razorpay_payment_id, amount=amount, currency="INR", status=status)
-                    except Exception:
-                        pass
-                    return {"status": "no_phone", "razorpay_payment_id": razorpay_payment_id}
-
-                # Record/update payment status
+                    phone = existing.get("phone")
+            else:
+                # tuple fallback: assume columns in order (id, phone, razorpay_payment_id, amount, currency, status, created_at)
+                # adjust indexing if your select returns different order; safer to use select with named columns
                 try:
-                    record_payment(phone=phone, razorpay_payment_id=razorpay_payment_id, amount=amount, currency="INR", status=status)
-                except Exception as e:
-                    print("handle_webhook_event: record_payment failed:", e, traceback.format_exc())
+                    # try to find status and phone by keys if row is sequence - best effort
+                    prev_status = existing.get("status") if hasattr(existing, "get") else existing[5] if len(existing) > 5 else None
+                except Exception:
+                    prev_status = None
 
-                # If payment captured/paid/authorized -> activate subscription
-                if status in ("captured", "authorized", "paid"):
-                    try:
-                        set_subscription_active(phone, days=30)
-                    except Exception as e:
-                        print("handle_webhook_event: set_subscription_active failed:", e, traceback.format_exc())
+        # ------------- Upsert the payment (idempotent) -------------
+        try:
+            _, latest_status = record_payment(phone=phone, razorpay_payment_id=razorpay_payment_id, amount=amount, currency="INR", status=status)
+        except Exception as e:
+            print("handle_webhook_event: record_payment failed:", e)
+            # continue — we may still decide not to crash on payment logging failure
+            latest_status = status
 
-                    # update user's razorpay_customer_id if present
-                    try:
-                        user = get_or_create_user(phone)
-                        user["razorpay_customer_id"] = payment_entity.get("customer_id") or user.get("razorpay_customer_id")
-                        save_user(user)
-                    except Exception as e:
-                        print("handle_webhook_event: saving user failed:", e, traceback.format_exc())
+        latest_status = (latest_status or status).lower()
 
-                    return {"phone": phone, "status": "activated"}
+        # ------------- Decide whether to activate subscription -------------
+        paid_states = ("captured", "paid", "authorized")
+        should_activate = False
+        if latest_status in paid_states:
+            # If prev_status is None (new record) OR prev_status not in paid_states, we need to activate now.
+            if not prev_status or prev_status not in paid_states:
+                should_activate = True
 
-                return {"phone": phone, "status": status}
+        if should_activate and phone:
+            try:
+                # set_subscription_active should be idempotent (update existing row)
+                set_subscription_active(phone, days=30)
+                print("handle_webhook_event: subscription activated for", phone)
+            except Exception as e:
+                print("handle_webhook_event: set_subscription_active failed:", e)
 
-        # Unknown / ignored event
-        return {"status": "ignored", "event": event}
+        return {"phone": phone, "razorpay_payment_id": razorpay_payment_id, "prev_status": prev_status, "latest_status": latest_status, "activated": should_activate}
     except Exception as e:
         print("handle_webhook_event: unhandled exception:", e, traceback.format_exc())
         return {"status": "error", "error": str(e)}
