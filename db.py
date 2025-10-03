@@ -15,29 +15,46 @@ def get_conn():
 def init_db():
     """Create tables and helpful indexes if they don't exist."""
     with get_conn() as conn, conn.cursor() as cur:
-        # users table
+         # Users table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            phone TEXT PRIMARY KEY,
-            created_at TIMESTAMP,
-            credits_remaining REAL,
-            subscription_active BOOLEAN,
+            id SERIAL PRIMARY KEY,
+            phone TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            credits_remaining FLOAT DEFAULT 30.0,
+            subscription_active BOOLEAN DEFAULT FALSE,
             subscription_expiry TIMESTAMP,
             razorpay_customer_id TEXT
-        )
+        );
         """)
-        # payments table
+
+        # Payments table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             id SERIAL PRIMARY KEY,
             phone TEXT,
-            razorpay_payment_id TEXT,
+            razorpay_payment_id TEXT UNIQUE,
             amount INTEGER,
-            currency TEXT,
+            currency TEXT DEFAULT 'INR',
             status TEXT,
-            created_at TIMESTAMP
-        )
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP
+        );
         """)
+
+        # Meeting notes table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS meeting_notes (
+            id SERIAL PRIMARY KEY,
+            phone TEXT NOT NULL,
+            audio_file TEXT,
+            transcript TEXT,
+            summary TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        """)
+
+
         # indexes (idempotent with IF NOT EXISTS)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_phone ON payments (phone)")
         # create a unique index on razorpay_payment_id to prevent duplicates
@@ -108,15 +125,74 @@ def get_remaining_minutes(phone):
     return float(user["credits_remaining"] or 0.0)
 
 def set_subscription_active(phone, days=30):
-    user = get_or_create_user(phone)
-    user["subscription_active"] = True
-    user["subscription_expiry"] = datetime.utcnow() + timedelta(days=days)
-    save_user(user)
-
-def record_payment(phone, razorpay_payment_id, amount, currency="INR", status="success"):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO payments (phone, razorpay_payment_id, amount, currency, status, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (phone, razorpay_payment_id, amount, currency, status, datetime.utcnow()))
+            UPDATE users
+            SET subscription_active = TRUE,
+                subscription_expiry = NOW() + (%s || ' days')::interval,
+                credits_remaining = GREATEST(COALESCE(credits_remaining, 0), 0)
+            WHERE phone = %s
+        """, (days, phone))
         conn.commit()
+
+
+# db.py (partial) — replace record_payment with this
+from datetime import datetime
+
+def record_payment(phone, razorpay_payment_id, amount, currency="INR", status="created"):
+    """
+    Insert or update a payment row for razorpay_payment_id.
+    This operation is idempotent: repeated calls with same
+    razorpay_payment_id will update the row instead of raising.
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO payments (phone, razorpay_payment_id, amount, currency, status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (razorpay_payment_id)
+            DO UPDATE SET
+                phone = EXCLUDED.phone,
+                amount = EXCLUDED.amount,
+                currency = EXCLUDED.currency,
+                status = EXCLUDED.status,
+                updated_at = EXCLUDED.updated_at
+            RETURNING id, status;
+        """, (phone, razorpay_payment_id, amount, currency, status, datetime.utcnow(), datetime.utcnow()))
+        row = cur.fetchone()
+        conn.commit()
+        # Return the id and status for further logic if needed
+        if row:
+            # RealDictCursor returns dict; handle both
+            if isinstance(row, dict):
+                return row.get("id"), row.get("status")
+            return row[0], row[1]
+        return None, None
+
+def save_meeting_notes(phone, audio_file, transcript, summary):
+    """
+    Store the meeting transcription + summary for a user.
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO meeting_notes (phone, audio_file, transcript, summary, created_at)
+            VALUES (%s, %s, %s, %s, NOW())
+        """, (phone, audio_file, transcript, summary))
+        conn.commit()
+
+def save_meeting_notes_with_sid(phone, audio_file, transcript, summary, message_sid=None):
+    """
+    Save meeting notes but include message_sid for deduplication.
+    If message_sid is already in DB, skip insert.
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        if message_sid:
+            cur.execute("SELECT 1 FROM meeting_notes WHERE message_sid=%s", (message_sid,))
+            if cur.fetchone():
+                # Already saved, skip
+                return
+
+        cur.execute("""
+            INSERT INTO meeting_notes (phone, audio_file, transcript, summary, message_sid)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (phone, audio_file, transcript, summary, message_sid))
+
