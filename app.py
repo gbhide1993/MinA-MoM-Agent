@@ -13,9 +13,10 @@ import json
 import tempfile
 import mimetypes
 import traceback
+import openai 
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
-
+import hashlib
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -26,17 +27,10 @@ from mutagen import File as MutagenFile  # keep mutagen for exact duration
 # db.py should expose: init_db, get_conn, get_or_create_user, get_remaining_minutes, deduct_minutes,
 #                    save_meeting_notes, save_user, set_subscription_active
 # payments.py should expose: create_payment_link_for_phone, handle_webhook_event, verify_razorpay_webhook
-from db import (
-    init_db,
-    get_conn,
-    get_or_create_user,
-    get_remaining_minutes,
-    deduct_minutes,
-    save_meeting_notes,
-    save_meeting_notes_with_sid,
-    save_user,
-    set_subscription_active,
-)
+
+from db import (init_db, get_conn, get_or_create_user, get_remaining_minutes, deduct_minutes, save_meeting_notes, save_meeting_notes_with_sid, save_user, decrement_minutes_if_available, set_subscription_active)
+import re
+
 from payments import create_payment_link_for_phone, handle_webhook_event, verify_razorpay_webhook
 
 # Load environment
@@ -357,6 +351,100 @@ def format_minutes_for_whatsapp(result: dict) -> str:
     return "\n\n".join(out).strip()
 
 
+# ======================================================
+# 🧩 HELPER FUNCTIONS — Audio + Text Summarization
+# ======================================================
+
+def normalize_phone_for_db(phone):
+    """Ensure consistent phone format for DB keys."""
+    if not phone:
+        return None
+    # Twilio sends whatsapp:+91XXXXXXXXXX — keep consistent
+    return phone.strip().lower().replace(" ", "")
+
+
+def download_media_to_local(url, fallback_ext=".m4a"):
+    """Download Twilio media to temp file and return local path."""
+    try:
+        ext = fallback_ext
+        temp_path = tempfile.mktemp(suffix=ext)
+        r = requests.get(url, stream=True, timeout=60)
+        r.raise_for_status()
+        with open(temp_path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+        print(f"✅ Saved media to {temp_path} ({len(open(temp_path, 'rb').read())} bytes)")
+        return temp_path
+    except Exception as e:
+        print("❌ Media download failed:", e)
+        return None
+
+
+def compute_audio_duration_seconds(file_path):
+    """Compute audio duration safely using Mutagen."""
+    try:
+        audio = MutagenFile(file_path)
+        if not audio or not getattr(audio.info, 'length', None):
+            return 0.0
+        return round(audio.info.length, 2)
+    except Exception as e:
+        print("⚠️ Could not compute duration:", e)
+        return 0.0
+
+
+def transcribe_audio_local_file(file_path):
+    """Transcribe the given local audio file using OpenAI Whisper."""
+    try:
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+        with open(file_path, "rb") as audio_file:
+            response = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+        transcript = response.text.strip()
+        print("✅ Transcription success (first 100 chars):", transcript[:100])
+        return transcript
+    except Exception as e:
+        print("❌ Transcription failed:", e)
+        raise RuntimeError(f"Transcription failed: {e}")
+
+
+def call_llm_summarize(text):
+    """Summarize and structure the meeting into readable bullet points."""
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+    prompt = f"""
+    You are MinA, an AI meeting summarizer. 
+    Summarize the following transcript in 5-8 crisp, structured bullet points with clarity and brevity.
+    Focus on:
+    - Key discussion points
+    - Decisions made
+    - Action items
+    - Deadlines or follow-ups if any
+    
+    Transcript:
+    {text}
+    """
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+        )
+        summary = response.choices[0].message.content.strip()
+        print("✅ LLM Summary generated (first 100 chars):", summary[:100])
+        return summary
+    except Exception as e:
+        print("❌ LLM summarization failed:", e)
+        raise RuntimeError(f"LLM summarization failed: {e}")
+
+
+def format_summary_for_whatsapp(summary_text):
+    """Make the summary WhatsApp-friendly (bold, emoji, bullet formatting)."""
+    formatted = re.sub(r"^- ", "• ", summary_text, flags=re.MULTILINE)
+    header = "📝 *Meeting Summary:*\n\n"
+    return header + formatted.strip()
+
+
 # ----------------------------
 # ROUTES: Twilio webhook
 # ----------------------------
@@ -375,136 +463,100 @@ def twilio_webhook():
     - save meeting notes
     - send WhatsApp reply
     """
+
     try:
-        sender = request.values.get("From") or request.values.get("from") or request.form.get("From")
-        if not sender:
-            debug_print("twilio-webhook: missing From")
-            return ("", 204)
+        sender_raw = request.values.get("From") or request.form.get("From")
+        sender = normalize_phone_for_db(sender_raw)
+        message_sid = request.values.get("MessageSid") or request.form.get("MessageSid")
+        media_url = request.values.get("MediaUrl0") or request.form.get("MediaUrl0")
+        # compute media_hash fallback if no MessageSid
+        media_hash = None
+        if not message_sid and media_url:
+            media_hash = hashlib.sha256(media_url.encode("utf-8")).hexdigest()
+        dedupe_key = message_sid or media_hash
 
-        num_media = int(request.values.get("NumMedia", 0))
-        body = request.values.get("Body", "") or ""
-        debug_print("Incoming from:", sender, "NumMedia:", num_media, "Body:", body[:200])
+        # Check dedupe before doing heavy work
+        if dedupe_key:
+            # quick SQL check
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM meeting_notes WHERE message_sid=%s LIMIT 1", (dedupe_key,))
+                if cur.fetchone():
+                    print("Duplicate message detected (dedupe_key). Skipping processing.")
+                    return ("", 204)
 
-        # If there's no media, send a friendly prompt
-        if num_media == 0:
-            send_whatsapp(sender, "Hi 👋 — please send a voice note and I'll create structured minutes (summary + action items).")
-            return ("", 204)
+        # download media to local file (your existing function)
+        local_path = download_media_to_local(media_url)  # your existing helper
 
-        # download first media
-        media_url = request.values.get("MediaUrl0")
-        media_type = request.values.get("MediaContentType0", "")
-        if not media_url:
-            send_whatsapp(sender, "Sorry — I couldn't find the audio file in your message.")
-            return ("", 204)
+        # compute duration using mutagen or your helper
+        duration_seconds = compute_audio_duration_seconds(local_path)  # existing helper
+        minutes = round(duration_seconds / 60.0, 2)
 
-        # Save file locally
-        try:
-            filename = download_file(media_url)
-        except Exception as e:
-            debug_print("Failed download_file:", e)
-            send_whatsapp(sender, "Sorry — couldn't download your audio. Please try again.")
-            return ("", 204)
+        # Now perform an atomic reservation: lock user row, check credits/subscription, deduct and insert meeting row
+        with get_conn() as conn, conn.cursor() as cur:
+            # normalize sender again to be safe
+            phone = sender
+            # lock user row to avoid race conditions
+            cur.execute("SELECT credits_remaining, subscription_active, subscription_expiry FROM users WHERE phone=%s FOR UPDATE", (phone,))
+            row = cur.fetchone()
+            if row:
+                credits_remaining = float(row[0]) if row[0] is not None else 0.0
+                sub_active = bool(row[1])
+                sub_expiry = row[2]
+            else:
+                # create user if missing
+                cur.execute("INSERT INTO users (phone, credits_remaining, subscription_active, created_at) VALUES (%s,%s,%s,now()) RETURNING credits_remaining, subscription_active, subscription_expiry", (phone, 30.0, False))
+                newr = cur.fetchone()
+                credits_remaining = float(newr[0])
+                sub_active = bool(newr[1])
+                sub_expiry = newr[2]
 
-        # compute duration (mutagen)
-        try:
-            duration_seconds = get_audio_duration_seconds(filename)
-            minutes = float(duration_seconds) / 60.0
-            debug_print(f"Audio duration: {duration_seconds:.2f}s ({minutes:.2f} minutes)")
-        except Exception as e:
-            debug_print("Duration computation failed:", e)
-            minutes = 1.0  # fallback minute
+            # If subscription active and not expired → do not deduct
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            if sub_active and (sub_expiry is None or sub_expiry > now):
+                to_deduct = 0.0
+            else:
+                to_deduct = minutes
 
-        # Ensure user record exists and fetch credits
-        try:
-            user = get_or_create_user(sender)
-            remaining = get_remaining_minutes(sender)
-            is_premium = bool(user.get("subscription_active"))
-        except Exception as e:
-            debug_print("User lookup failed:", e)
-            # allow processing but don't deduct reliably
-            user = None
-            remaining = 0.0
-            is_premium = False
-
-        # If not premium and not enough minutes: supply payment link and abort
-        if not is_premium:
-            if remaining <= 0:
-                # create payment link
-                try:
-                    pl = create_payment_link_for_phone(sender, amount_in_rupees=499)
-                    payment_link = pl.get("short_url")
-                except Exception as e:
-                    debug_print("create_payment_link_for_phone failed:", e)
-                    payment_link = os.getenv("FALLBACK_PAYMENT_URL", "https://your-website.example/subscribe")
-                send_whatsapp(sender, f"⚠️ You have used your free minutes. Subscribe for ₹499/month to continue: {payment_link}")
+            if to_deduct > 0 and credits_remaining < to_deduct:
+                # Not enough credits
+                conn.rollback()
+                send_whatsapp(phone, "⚠️ You have insufficient free minutes. Please subscribe to continue: <link>")
                 return ("", 204)
 
-            if remaining < minutes:
-                try:
-                    pl = create_payment_link_for_phone(sender, amount_in_rupees=499)
-                    payment_link = pl.get("short_url")
-                except Exception as e:
-                    debug_print("create_payment_link_for_phone failed:", e)
-                    payment_link = os.getenv("FALLBACK_PAYMENT_URL", "https://your-website.example/subscribe")
-                send_whatsapp(sender, f"Recording is {minutes:.1f} min but you have only {remaining:.1f} free minutes left. Subscribe: {payment_link}")
-                return ("", 204)
+            # Deduct credits if needed
+            if to_deduct > 0:
+                new_credits = credits_remaining - to_deduct
+                cur.execute("UPDATE users SET credits_remaining=%s WHERE phone=%s", (new_credits, phone))
+            # Insert meeting row with message_sid = dedupe_key
+            cur.execute("""
+                INSERT INTO meeting_notes (phone, audio_file, transcript, summary, message_sid, created_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                RETURNING id
+            """, (phone, media_url, None, None, dedupe_key))
+            meeting_id = cur.fetchone()[0]
+            conn.commit()
 
-        # Transcribe (always attempt if media present)
-        try:
-            transcript = transcribe_audio(filename, language=LANGUAGE)
-            debug_print("Transcript (preview):", transcript[:300])
-        except Exception as e:
-            debug_print("Transcription failed, not deducting minutes:", e, traceback.format_exc())
-            send_whatsapp(sender, f"Sorry - failed to process your audio. Error: {str(e)[:200]}")
-            return ("", 204)
+        # Now transcribe & summarize outside transaction (or you can transcribe before the transaction and include in insert)
+        transcript = transcribe_audio_local_file(local_path)  # your function
+        summary_text = call_llm_summarize(transcript)
 
-        # Deduct minutes for non-premium AFTER success
-        if not is_premium:
-            try:
-                new_remaining = deduct_minutes(sender, minutes)
-                debug_print(f"Deducted {minutes:.2f} minutes from {sender}, remaining {new_remaining:.2f}")
-            except Exception as e:
-                debug_print("Failed to deduct minutes (DB error) but proceeding:", e)
+        # Update the meeting_notes row with transcript and summary
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE meeting_notes SET transcript=%s, summary=%s WHERE id=%s", (transcript, summary_text, meeting_id))
+            conn.commit()
 
-        # Summarize via LLM
-        try:
-            llm_result = call_llm_for_minutes_and_bullets(transcript)
-            formatted_message = format_minutes_for_whatsapp(llm_result)
-        except Exception as e:
-            debug_print("LLM summarization error:", e, traceback.format_exc())
-            formatted_message = "Sorry — failed to summarize the audio."
+        # Reply to user
+        send_whatsapp(phone, format_summary_for_whatsapp(summary_text))
 
-        # Log and persist meeting notes
-        debug_print("=== MinA Summary for", sender, "===")
-        debug_print(formatted_message)
-        debug_print("=== End of Summary ===")
-
-        message_sid = request.values.get("MessageSid")
-
-        try:
-            save_meeting_notes_with_sid(
-            phone=sender,
-            audio_file=media_url,
-            transcript=transcript,
-            summary=formatted_message,
-            message_sid=message_sid
-            )
-            debug_print("Meeting notes saved for", sender, "sid:", message_sid)
-        except Exception as e:
-            debug_print("Failed to save meeting notes:", e, traceback.format_exc())
-
-        # Send WhatsApp reply
-        send_whatsapp(sender, formatted_message)
-
-        # If TEST_MODE, return content to caller for integration tests
-        if TEST_MODE:
-            return formatted_message, 200
         return ("", 204)
 
     except Exception as e:
-        debug_print("Unhandled exception in twilio_webhook:", e, traceback.format_exc())
-        # If something exploded unexpectedly, still respond 204 so Twilio doesn't keep retrying
+        print("ERROR processing twilio webhook:", e, traceback.format_exc())
+        # if you want: refund in case we deducted but failed to insert (double-safety)
+        # refund_credits_if_needed(phone, minutes)  <-- implement if required
         return ("", 204)
+
 
 
 # ----------------------------------
