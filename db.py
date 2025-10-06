@@ -1,7 +1,9 @@
 # db.py (PostgreSQL version)
 import psycopg2
+from utils import normalize_phone_for_db
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -89,20 +91,22 @@ def save_user(user):
         ))
         conn.commit()
 
-def get_or_create_user(phone, free_minutes=30.0):
-    user = get_user(phone)
-    if user:
-        return user
-    user = {
-        "phone": phone,
-        "created_at": datetime.utcnow(),
-        "credits_remaining": free_minutes,
-        "subscription_active": False,
-        "subscription_expiry": None,
-        "razorpay_customer_id": None
-    }
-    save_user(user)
-    return user
+def get_or_create_user(raw_phone: str):
+    phone = normalize_phone_for_db(raw_phone)
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM users WHERE phone = %s", (phone,))
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        # create default user row
+        cur.execute("""
+            INSERT INTO users (phone, credits_remaining, subscription_active, subscription_expiry, created_at)
+            VALUES (%s, %s, %s, %s, now())
+            RETURNING *
+        """, (phone, 30.0, False, None))
+        new_row = cur.fetchone()
+        conn.commit()
+        return dict(new_row) if new_row else None
 
 def deduct_minutes(phone, minutes):
     user = get_user(phone)
@@ -179,20 +183,97 @@ def save_meeting_notes(phone, audio_file, transcript, summary):
         """, (phone, audio_file, transcript, summary))
         conn.commit()
 
-def save_meeting_notes_with_sid(phone, audio_file, transcript, summary, message_sid=None):
+def save_meeting_notes_with_sid(raw_phone, audio_file, transcript, summary, message_sid=None):
     """
-    Save meeting notes but include message_sid for deduplication.
-    If message_sid is already in DB, skip insert.
+    Save meeting notes and dedupe by message_sid.
+    Accepts phone as raw string (e.g. '+919876543210' or 'whatsapp:+919876543210').
+    Returns dict {id: ..., skipped: True/False}
     """
+    phone = normalize_phone_for_db(raw_phone)
     with get_conn() as conn, conn.cursor() as cur:
         if message_sid:
-            cur.execute("SELECT 1 FROM meeting_notes WHERE message_sid=%s", (message_sid,))
+            cur.execute("SELECT 1 FROM meeting_notes WHERE message_sid=%s LIMIT 1", (message_sid,))
             if cur.fetchone():
-                # Already saved, skip
-                return
+                return {"skipped": True, "id": None}
 
         cur.execute("""
-            INSERT INTO meeting_notes (phone, audio_file, transcript, summary, message_sid)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO meeting_notes (phone, audio_file, transcript, summary, message_sid, created_at)
+            VALUES (%s, %s, %s, %s, %s, now())
+            RETURNING id
         """, (phone, audio_file, transcript, summary, message_sid))
+        row = cur.fetchone()
+        conn.commit()
+        return {"skipped": False, "id": row[0] if row else None}
+
+
+
+def upsert_payment_and_activate(raw_phone, razorpay_payment_id, amount, status):
+    """
+    Upsert a payment row using razorpay_payment_id unique index and activate user if status=='captured'
+    """
+    phone = normalize_phone_for_db(raw_phone)
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # Upsert payment (requires unique index on razorpay_payment_id)
+        cur.execute("""
+          INSERT INTO payments (phone, razorpay_payment_id, amount, status, created_at)
+          VALUES (%s, %s, %s, %s, now())
+          ON CONFLICT (razorpay_payment_id)
+          DO UPDATE SET status = EXCLUDED.status, amount = EXCLUDED.amount
+          RETURNING id, razorpay_payment_id, status;
+        """, (phone, razorpay_payment_id, amount, status))
+        payment_row = cur.fetchone()
+
+        activated = False
+        if status and str(status).lower() == 'captured':
+            # create user if missing, and activate/extend subscription
+            cur.execute("""
+                INSERT INTO users (phone, credits_remaining, subscription_active, subscription_expiry, created_at)
+                VALUES (%s, %s, TRUE, now() + interval '30 days', now())
+                ON CONFLICT (phone) DO UPDATE
+                  SET subscription_active = TRUE,
+                      subscription_expiry = now() + interval '30 days'
+                RETURNING phone, subscription_active, subscription_expiry;
+            """, (phone, 30.0))
+            _ = cur.fetchone()
+            activated = True
+
+        conn.commit()
+        return {"payment": dict(payment_row) if payment_row else None, "activated": activated}
+
+def get_user_by_phone(raw_phone):
+    phone = normalize_phone_for_db(raw_phone)
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM users WHERE phone = %s", (phone,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+    
+def decrement_minutes_if_available(raw_phone, minutes_to_deduct: float):
+    phone = normalize_phone_for_db(raw_phone)
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # fetch current values
+        cur.execute("SELECT credits_remaining, subscription_active, subscription_expiry FROM users WHERE phone = %s FOR UPDATE", (phone,))
+        row = cur.fetchone()
+        if not row:
+            # user missing — create default
+            cur.execute("INSERT INTO users (phone, credits_remaining) VALUES (%s, %s) RETURNING credits_remaining", (phone, 30.0))
+            row = cur.fetchone()
+
+        # If subscription active & not expired, allow unlimited (or don't decrement)
+        sub_active = bool(row.get('subscription_active'))
+        expiry = row.get('subscription_expiry')
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        if sub_active and (expiry is None or expiry > now):
+            # subscription active: do not deduct (or deduct differently)
+            conn.commit()
+            return {"ok": True, "deducted": 0.0, "remaining": row.get('credits_remaining')}
+
+        current = float(row.get('credits_remaining') or 0.0)
+        if current < minutes_to_deduct:
+            return {"ok": False, "reason": "insufficient_credits", "remaining": current}
+        new_remaining = current - minutes_to_deduct
+        cur.execute("UPDATE users SET credits_remaining = %s WHERE phone = %s", (new_remaining, phone))
+        conn.commit()
+        return {"ok": True, "deducted": minutes_to_deduct, "remaining": new_remaining}
+
 
