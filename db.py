@@ -13,10 +13,52 @@ import json
 # Use DATABASE_URL from environment
 DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
-    raise RuntimeError("DATABASE_URL must be set in environment (production).")
+    raise RuntimeError("DATABASE_URL must be set in environment (Production).")
 
+@contextmanager
 def get_conn():
-    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+    """
+    Yields a psycopg2 connection.
+    """
+    conn = psycopg2.connect(DB_URL)
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+@contextmanager
+def get_cursor():
+    """
+    Yields a cursor configured to return mapping-like rows (RealDictCursor).
+    Commits on success, rollbacks on exception.
+    """
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            yield cur
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+def fetchone_normalized(cur):
+    """Return dict or None, works with RealDictRow or tuple (fallback)."""
+    row = cur.fetchone()
+    if not row:
+        return None
+    if hasattr(row, "items") or isinstance(row, dict):
+        return dict(row)
+    # tuple fallback: convert to dict using cursor.description
+    cols = [d.name for d in cur.description]  # psycopg2 cursor.description objects have .name
+    return dict(zip(cols, row))
 
 def init_db():
     """Create tables and helpful indexes if they don't exist."""
