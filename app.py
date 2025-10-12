@@ -594,7 +594,18 @@ def twilio_webhook():
                 VALUES (%s, %s, %s, %s, %s, now())
                 RETURNING id
             """, (phone, media_url, None, None, dedupe_key))
-            meeting_id = cur.fetchone()[0]
+            new_row = cur.fetchone()
+            # Normalize whether fetchone returns mapping-like (RealDictRow) or tuple-like
+            if not new_row:
+                conn.rollback()
+                raise RuntimeError("Failed to insert meeting_notes row (no row returned)")
+            if hasattr(new_row, "get"):
+                meeting_id = new_row.get("id")
+            else:
+                meeting_id = new_row[0]
+            if meeting_id is None:
+                conn.rollback()
+                raise RuntimeError("Failed to read meeting id after insert")
             conn.commit()
 
         # Now transcribe & summarize outside transaction (or you can transcribe before the transaction and include in insert)
@@ -695,7 +706,19 @@ def admin_get_user(phone):
             row = cur.fetchone()
             if not row:
                 return jsonify({"error": "not found"}), 404
-            return jsonify({"user": row}), 200
+
+            if hasattr(row, "get"):
+                user_obj = dict(row)
+            else:
+                # tuple-like: map columns by order
+                user_obj = {
+                    "phone": row[0],
+                    "credits_remaining": row[1],
+                    "subscription_active": row[2],
+                    "subscription_expiry": row[3],
+                    "created_at": row[4]
+                }
+            return jsonify({"user": user_obj}), 200
     except Exception as e:
         debug_print("admin_get_user error:", e, traceback.format_exc())
         return jsonify({"error": str(e)}), 500
@@ -707,10 +730,22 @@ def admin_get_notes(phone):
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT id, audio_file, summary, created_at FROM meeting_notes WHERE phone=%s ORDER BY created_at DESC LIMIT 50", (phone,))
             rows = cur.fetchall()
-            return jsonify({"notes": rows}), 200
+            normalized = []
+            for r in rows or []:
+                if hasattr(r, "get"):
+                    normalized.append(dict(r))
+                else:
+                    normalized.append({
+                        "id": r[0],
+                        "audio_file": r[1],
+                        "summary": r[2],
+                        "created_at": r[3]
+                    })
+            return jsonify({"notes": normalized}), 200
     except Exception as e:
         debug_print("admin_get_notes error:", e, traceback.format_exc())
         return jsonify({"error": str(e)}), 500
+
 
 
 # -------------------------
