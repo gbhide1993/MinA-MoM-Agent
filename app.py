@@ -543,12 +543,31 @@ def twilio_webhook():
                 sub_active = bool(row[1])
                 sub_expiry = row[2]
             else:
-                # create user if missing
-                cur.execute("INSERT INTO users (phone, credits_remaining, subscription_active, created_at) VALUES (%s,%s,%s,now()) RETURNING credits_remaining, subscription_active, subscription_expiry", (phone, 30.0, False))
-                newr = cur.fetchone()
-                credits_remaining = float(newr[0])
-                sub_active = bool(newr[1])
-                sub_expiry = newr[2]
+    # create user if missing (RETURNING may return a mapping or tuple depending on cursor factory)
+    cur.execute("""
+        INSERT INTO users (phone, credits_remaining, subscription_active, created_at)
+        VALUES (%s, %s, %s, now())
+        RETURNING credits_remaining, subscription_active, subscription_expiry
+    """, (phone, 30.0, False))
+    newr = cur.fetchone()
+    # Normalize fetch result whether it's mapping-like (RealDictRow) or tuple-like
+    if newr is None:
+        # fallback defaults
+        credits_remaining = 30.0
+        sub_active = False
+        sub_expiry = None
+    else:
+        if hasattr(newr, "get"):
+            # mapping-like
+            credits_remaining = float(newr.get("credits_remaining") or 0.0)
+            sub_active = bool(newr.get("subscription_active") or False)
+            sub_expiry = newr.get("subscription_expiry")
+        else:
+            # tuple-like
+            credits_remaining = float(newr[0] or 0.0)
+            sub_active = bool(newr[1])
+            sub_expiry = newr[2]
+
 
             # If subscription active and not expired → do not deduct
             from datetime import datetime, timezone
@@ -710,4 +729,5 @@ if __name__ == "__main__":
     debug_print("Starting Flask app (FLASK_DEBUG=%s) on port %s" % (flask_debug, os.getenv("PORT", "5000")))
     # Always bind to 0.0.0.0 so Render/local dev can reach it
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=flask_debug)
+
 
