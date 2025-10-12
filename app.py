@@ -40,9 +40,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM") or os.getenv("TWILIO_FROM")
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
-TEST_MODE = os.getenv("TEST_MODE", "0") == "1"
 LANGUAGE = os.getenv("LANGUAGE", "en")
+DATABASE_URL = os.getenv("DATABASE_URL")
 DEFAULT_SUBSCRIPTION_MINUTES = float(os.getenv("DEFAULT_SUBSCRIPTION_MINUTES", "30.0"))
 
 # Twilio client
@@ -363,21 +365,40 @@ def normalize_phone_for_db(phone):
     return phone.strip().lower().replace(" ", "")
 
 
+
+
 def download_media_to_local(url, fallback_ext=".m4a"):
-    """Download Twilio media to temp file and return local path."""
-    try:
-        ext = fallback_ext
-        temp_path = tempfile.mktemp(suffix=ext)
-        r = requests.get(url, stream=True, timeout=60)
-        r.raise_for_status()
-        with open(temp_path, "wb") as f:
-            for chunk in r.iter_content(8192):
-                f.write(chunk)
-        print(f"✅ Saved media to {temp_path} ({len(open(temp_path, 'rb').read())} bytes)")
-        return temp_path
-    except Exception as e:
-        print("❌ Media download failed:", e)
+    """Download Twilio media (with Basic Auth if needed) to temp file and return local path."""
+    if not url:
+        debug_print("download_media_to_local: no url")
         return None
+    try:
+        auth = None
+        parsed = urlparse(url)
+        # If Twilio domain, use Basic Auth
+        if "twilio.com" in parsed.netloc and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+            auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        resp = requests.get(url, stream=True, timeout=60, auth=auth)
+        resp.raise_for_status()
+    except Exception as e:
+        debug_print("download_media_to_local: request failed:", e)
+        return None
+
+    # decide extension
+    ct = resp.headers.get("Content-Type", "")
+    ext = _ext_from_content_type(ct) or os.path.splitext(unquote(parsed.path))[1] or fallback_ext
+    tmp_path = tempfile.mktemp(suffix=ext)
+    try:
+        with open(tmp_path, "wb") as f:
+            for chunk in resp.iter_content(8192):
+                if chunk:
+                    f.write(chunk)
+        debug_print(f"Saved media to {tmp_path} (Content-Type: {ct})")
+        return tmp_path
+    except Exception as e:
+        debug_print("download_media_to_local: write failed:", e)
+        return None
+
 
 
 def compute_audio_duration_seconds(file_path):
@@ -483,6 +504,25 @@ def twilio_webhook():
                 if cur.fetchone():
                     print("Duplicate message detected (dedupe_key). Skipping processing.")
                     return ("", 204)
+        
+        # If no media present, respond politely to text-only users and stop
+        body_text = (request.values.get("Body") or request.form.get("Body") or "").strip()
+        if not media_url:
+            # Use the normalized sender we already computed
+            try:
+                if body_text:
+                    send_whatsapp(sender, (
+                        "Hi 👋 — I can generate meeting minutes from a short *voice note* (audio). "
+                        "Please send a voice message and I will transcribe and summarize it for you. 🎙️"
+                    ))
+                else:
+                    send_whatsapp(sender, (
+                        "Hi 👋 — please send a short *voice note* (audio) and I will create meeting minutes for you."
+                    ))
+            except Exception as e:
+                debug_print("Failed to send guidance reply:", e)
+            return ("", 204)
+
 
         # download media to local file (your existing function)
         local_path = download_media_to_local(media_url)  # your existing helper
@@ -565,45 +605,60 @@ def twilio_webhook():
 @app.route("/razorpay-webhook", methods=["POST"])
 def razorpay_webhook():
     """
-    Razorpay webhook endpoint. We expect Razorpay to post signed JSON.
-    We verify signature (verify_razorpay_webhook) if available. Then delegate to payments.handle_webhook_event
-    which is expected to be idempotent.
+    Razorpay webhook endpoint (production-safe).
+    - Verify signature using raw request bytes and the X-Razorpay-Signature header.
+    - If verification passes, parse JSON and delegate to handle_webhook_event().
+    - Returns:
+        200 OK  -> processed successfully
+        204 No Content -> event ignored (not relevant)
+        400 Bad Request -> signature or JSON invalid
+        500 Internal Server Error -> processing exception
     """
-    raw = request.get_data()
-    hdr = request.headers.get("X-Razorpay-Signature", "")
-    debug_print("DEBUG — header signature:", hdr)
-    debug_print("DEBUG — raw body (first 300 bytes):", raw[:300])
+    # raw bytes (important — do not decode before verification)
+    raw_bytes = request.get_data()
+    signature_hdr = request.headers.get("X-Razorpay-Signature", "") or request.headers.get("x-razorpay-signature", "")
 
-    payload_str = None
+    debug_print("DEBUG — razorpay webhook received, signature header:", signature_hdr)
+    debug_print("DEBUG — raw body (first 300 bytes):", raw_bytes[:300])
+
+    # 1) Verify signature (use bytes + header). verify_razorpay_webhook expects bytes.
     try:
-        payload_str = raw.decode("utf-8")
-    except Exception:
-        payload_str = raw
+        verified = verify_razorpay_webhook(raw_bytes, signature_hdr)
+    except Exception as e:
+        debug_print("verify_razorpay_webhook raised exception:", e, traceback.format_exc())
+        verified = False
 
-    # verify signature if function is present
+    if not verified:
+        # In production we should reject invalid signatures
+        debug_print("Razorpay webhook signature verification FAILED. Rejecting with 400.")
+        return ("Signature verification failed", 400)
+
+    # 2) Parse JSON after successful signature verification
     try:
-        ok = False
-        try:
-            ok = verify_razorpay_webhook(payload_str, hdr)
-            debug_print("verify_razorpay_webhook: signature verified ✅")
-        except Exception as e:
-            debug_print("verify_razorpay_webhook: SDK verification failed:", e)
-            # In local testing we may allow continuing; in production you can return 400
-            # return ("Signature mismatch", 400)
-            ok = False
-
         event_json = request.get_json(force=True)
     except Exception as e:
-        debug_print("Invalid Razorpay webhook JSON:", e)
+        debug_print("Invalid Razorpay webhook JSON:", e, traceback.format_exc())
         return ("Invalid JSON", 400)
 
+    # 3) Delegate to handler (idempotent). handle_webhook_event returns a dict summary.
     try:
         res = handle_webhook_event(event_json)
         debug_print("Razorpay webhook handled:", res)
-        return ("OK", 200)
+
+        # Map handler response to HTTP code:
+        status = res.get("status", "").lower()
+        if status in ("ignored", "no_payment_entity"):
+            return ("", 204)
+        if status == "ok":
+            return ("OK", 200)
+
+        # anything else -> internal error
+        debug_print("Unhandled handler result (treat as error):", res)
+        return (str(res), 500)
     except Exception as e:
         debug_print("Error handling Razorpay webhook:", e, traceback.format_exc())
-        return ("", 500)
+        return ("Internal error", 500)
+
 
 
 # -------------------------
@@ -650,9 +705,9 @@ def health():
 # Main run
 # -------------------------
 if __name__ == "__main__":
-    debug_print("Starting Flask app (debug mode: True if TEST_MODE)... TEST_MODE=", TEST_MODE)
-    if TEST_MODE:
-        app.run(host="0.0.0.0", port=5000, debug=True)
-    else:
-        # In production Render/Gunicorn will serve this.
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    # Use FLASK_DEBUG env var for local debugging only. Defaults to False in production.
+    flask_debug = str(os.getenv("FLASK_DEBUG", "0")).lower() in ("1", "true", "yes")
+    debug_print("Starting Flask app (FLASK_DEBUG=%s) on port %s" % (flask_debug, os.getenv("PORT", "5000")))
+    # Always bind to 0.0.0.0 so Render/local dev can reach it
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=flask_debug)
+
