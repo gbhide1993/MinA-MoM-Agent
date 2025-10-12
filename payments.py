@@ -7,12 +7,18 @@ import base64
 import json
 from datetime import datetime
 import traceback
+import time
+import logging
+import requests
+
+
 
 from db import record_payment, set_subscription_active, save_user, get_or_create_user
+from db import record_payment as insert_payment
 from db import get_user, get_conn  # get_conn used for direct queries
 from db import upsert_payment_and_activate
 from utils import normalize_phone_for_db
-
+from typing import Optional
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
@@ -30,198 +36,311 @@ def get_client():
     return _client
 
 
-def create_payment_link_for_phone(phone, amount_in_rupees=499, purpose="MinA subscription"):
-    """
-    Create a Razorpay Payment Link and return a dict with details.
-    Also records a payments row with status 'created'.
-    """
-    client = get_client()
+logger = logging.getLogger(__name__)
 
-    amount_paise = int(amount_in_rupees * 100)
-    ref_id = f"{phone.replace('whatsapp:', '').replace('+','')}-{int(datetime.utcnow().timestamp())}"
+def create_payment_link_for_phone(phone: str, amount_in_rupees: float, currency: str = "INR", reference_id: Optional[str] = None):
+    """
+    Create a Razorpay order/payment link (production-safe):
+      - amount_in_rupees: e.g. 10.5 -> converted to paise (1050)
+      - phone: in normalized form (use normalize_phone_for_db before calling)
+      - reference_id: optional external reference; if not provided one will be generated
+
+    This function:
+      - builds a stable reference_id (if not provided)
+      - creates an order via SDK or REST
+      - upserts a row in payments table (idempotent) using insert_payment / record_payment helper
+      - returns the order dict (as returned by Razorpay) or raises an exception.
+    """
+    if amount_in_rupees is None:
+        raise ValueError("amount_in_rupees required")
+
+    # Normalize phone (best-effort)
+    try:
+        normalized_phone = normalize_phone_for_db(phone)
+    except Exception:
+        normalized_phone = phone
+
+    # ensure integer paise
+    try:
+        amount_paise = int(round(float(amount_in_rupees) * 100))
+    except Exception:
+        raise ValueError("amount_in_rupees must be numeric")
+
+    # stable reference id so we can look up / re-run idempotently
+    if not reference_id:
+        cleaned_phone = normalized_phone.replace("whatsapp:", "").replace("+", "")
+        reference_id = f"ref-{cleaned_phone}-{int(time.time())}"
+
+    # Build payload for Razorpay order
     payload = {
         "amount": amount_paise,
-        "currency": "INR",
-        "accept_partial": False,
-        "reference_id": ref_id,
-        "description": purpose,
-        "customer": {
-            "contact": phone.replace("whatsapp:", "")
-        },
-        "notify": { "sms": False, "email": False },
-        "reminder_enable": True,
+        "currency": currency,
+        "receipt": reference_id,
+        "payment_capture": 1,  # auto-capture recommended for simplicity
+        "notes": {
+            "phone": normalized_phone,
+            "reference_id": reference_id
+        }
     }
 
-    link = client.payment_link.create(payload)
-    # Persist a pending payment record
+    # Create the order via SDK if available, otherwise via REST
+    order = None
     try:
-        record_payment(
-            phone=phone,
-            razorpay_payment_id=link.get("id"),
-            amount=link.get("amount"),
-            currency=link.get("currency", "INR"),
-            status=link.get("status", "created")
+        client = get_client()  # your existing helper that returns a razorpay.Client or None
+        if client:
+            order = client.order.create(data=payload)
+        else:
+            # fallback to REST
+            r = requests.post(
+                "https://api.razorpay.com/v1/orders",
+                auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+                json=payload,
+                timeout=30
+            )
+            r.raise_for_status()
+            order = r.json()
+    except Exception as e:
+        logger.exception("Failed to create Razorpay order: %s", e)
+        raise
+
+    # Ensure we have an order id
+    order_id = order.get("id") or order.get("order_id") or order.get("entity", {}).get("id")
+    if not order_id:
+        logger.error("Razorpay order returned without id: %s", order)
+        raise RuntimeError("Razorpay order creation failed (no id)")
+
+    # Persist a payment record in DB (idempotent upsert)
+    try:
+        # Prefer insert_payment helper (insert or update based on razorpay_payment_id)
+        # The amount column in DB expects paise (store consistent integer)
+        insert_payment(
+            phone=normalized_phone,
+            razorpay_payment_id=order_id,
+            amount=amount_paise,
+            currency=currency,
+            status=order.get("status", "created"),
+            reference_id=reference_id
         )
     except Exception as e:
-        print("Warning: record_payment failed after creating link:", e, traceback.format_exc())
+        # Log but do not delete the created order automatically; operator can reconcile
+        logger.exception("Failed to persist payment row for order %s: %s", order_id, e)
 
+    # Return the order object for the caller to construct payment link / respond to client
     return {
-        "id": link.get("id"),
-        "short_url": link.get("short_url"),
-        "amount": link.get("amount"),
-        "status": link.get("status"),
-        "reference_id": link.get("reference_id")
+        "order": order,
+        "reference_id": reference_id,
+        "order_id": order_id,
+        "amount_paise": amount_paise,
+        "currency": currency,
     }
 
 
-def verify_razorpay_webhook(payload_body: str, header_signature: str) -> bool:
+def verify_razorpay_webhook(payload_body: bytes, header_signature: str) -> bool:
     """
-    Verify webhook signature using Razorpay SDK if possible, fallback to manual HMAC.
-    payload_body must be a decoded string (UTF-8).
+    Verify Razorpay webhook signature.
+    - payload_body: raw request body bytes (important: exact bytes)
+    - header_signature: X-Razorpay-Signature header string
+    Returns True when verified.
     """
     if not RAZORPAY_WEBHOOK_SECRET:
         print("verify_razorpay_webhook: missing RAZORPAY_WEBHOOK_SECRET")
         return False
 
-    # Try SDK verification (preferred)
+    # Try SDK verification first (preferred)
     try:
         client = get_client()
-        client.utility.verify_webhook_signature(payload_body, header_signature, RAZORPAY_WEBHOOK_SECRET)
-        # If no exception, signature verified
+        # SDK expects string payload; pass decoded utf-8 string
+        client.utility.verify_webhook_signature(payload_body.decode("utf-8"), header_signature, RAZORPAY_WEBHOOK_SECRET)
         return True
     except Exception as e:
-        # SDK verification may fail if keys missing or mismatch; print for debug and fall back.
+        # SDK verification failed — fall back
         print("verify_razorpay_webhook: SDK verification failed:", repr(e))
 
-    # Fallback: manual HMAC-SHA256 + base64 compare
+    # Fallback: HMAC-SHA256
     try:
-        computed = base64.b64encode(
-            hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), payload_body.encode("utf-8"), hashlib.sha256).digest()
-        ).decode()
-        # constant-time comparison
-        ok = hmac.compare_digest(computed, header_signature)
-        if not ok:
-            print("verify_razorpay_webhook: fallback verification failed. header:", header_signature, "computed:", computed)
-        return ok
-    except Exception as e:
-        print("verify_razorpay_webhook: fallback verification exception:", e, traceback.format_exc())
+        # HMAC raw digest
+        digest = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), payload_body, hashlib.sha256).digest()
+
+        # Try base64 encoding (Razorpay examples often use base64)
+        computed_b64 = base64.b64encode(digest).decode()
+        if hmac.compare_digest(computed_b64, header_signature):
+            return True
+
+        # Try hex digest (some integrations/SDKs use hexdigest)
+        computed_hex = hashlib.sha256(payload_body + b"").hexdigest()
+        # the correct hex to compare would be hmac.new(secret, payload, sha256).hexdigest()
+        computed_hex = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), payload_body, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(computed_hex, header_signature):
+            return True
+
+        # Nope
+        print("verify_razorpay_webhook: fallback verification failed. header:", header_signature, "computed_b64:", computed_b64, "computed_hex:", computed_hex)
         return False
+    except Exception as e:
+        print("verify_razorpay_webhook: fallback exception:", e, traceback.format_exc())
+        return False
+
 
 
 # payments.py — replace handle_webhook_event with this
 
-def handle_webhook_event(event_json: dict):
+import traceback
+from typing import Optional
+
+def handle_webhook_event(event_json: dict) -> dict:
     """
-    Idempotent webhook handler.
-    - Upserts / records payment via record_payment(...)
-    - Activates subscription only when status transitions into a 'paid/captured' state.
-    - Returns a dict describing the result for logging.
+    Clean, idempotent Razorpay webhook handler.
+
+    Input: event_json (decoded JSON payload from Razorpay)
+    Output: dict with keys:
+      - status: "ok" | "ignored" | "error" | "no_payment_entity"
+      - event: original event name
+      - razorpay_payment_id: (if present)
+      - prev_status: previous status from DB (if found)
+      - latest_status: current status determined after upsert
+      - activated: True if subscription activation attempted & succeeded
+      - note: optional human-readable note
     """
     try:
         event = event_json.get("event")
-        data = event_json.get("payload", {})
+        payload = event_json.get("payload", {}) or {}
 
-        # Filter events we care about
-        if event not in ("payment_link.paid", "payment_link.payment_paid", "payment.captured", "payment.authorized", "payment.failed"):
-            return {"status": "ignored", "event": event}
+        # Only handle relevant events; ignore others gracefully
+        interested = {
+            "payment_link.paid",
+            "payment_link.payment_paid",
+            "payment.captured",
+            "payment.authorized",
+            "payment.failed",
+            "payment.authorized",
+            "order.paid"
+        }
+        if event not in interested:
+            return {"status": "ignored", "event": event, "note": "event not in interested set"}
 
-        # Robust extraction of payment entity
+        # --- Extract payment entity robustly ---
         payment_entity = None
-        if isinstance(data.get("payment"), dict):
-            payment_entity = data.get("payment", {}).get("entity")
+
+        # Common safe extraction paths:
+        if isinstance(payload.get("payment"), dict):
+            payment_entity = payload.get("payment", {}).get("entity")
+
+        # Fallback: scan payload values for something that looks like a payment entity
         if not payment_entity:
-            # fallback scan for any nested entity that looks like a payment entity
-            for val in data.values():
-                if isinstance(val, dict) and isinstance(val.get("entity"), dict):
-                    ent = val["entity"]
-                    if ent.get("id") and ent.get("status"):
+            for v in payload.values():
+                if isinstance(v, dict):
+                    ent = v.get("entity") or v.get("payment") or v.get("entity", None)
+                    if isinstance(ent, dict) and ent.get("id") and ent.get("status"):
                         payment_entity = ent
                         break
+                # sometimes payload has nested structure: payload -> payment -> entity
+                # we already tried the common path above
 
         if not payment_entity:
-            print("handle_webhook_event: no payment entity found in payload")
-            return {"status": "no_payment_entity", "event": event}
+            # nothing to do
+            return {"status": "no_payment_entity", "event": event, "note": "no payment entity found"}
 
+        # --- Read core fields ---
         razorpay_payment_id = payment_entity.get("id")
-        amount = payment_entity.get("amount")
-        status_raw = payment_entity.get("status") or ""
-        status = status_raw.lower()
-        # common possible contact fields
-        contact = payment_entity.get("contact") or payment_entity.get("customer") or payment_entity.get("phone") or None
+        amount = payment_entity.get("amount")  # usually in paise
+        status_raw = (payment_entity.get("status") or "")
+        latest_status_in_payload = status_raw.lower()
 
-        # Normalize contact to 'whatsapp:+<digits>' using utils helper
-        phone = None
+        # Try to extract a phone/contact if present
+        contact = payment_entity.get("contact") or payment_entity.get("customer") or payment_entity.get("phone") or None
+        phone: Optional[str] = None
         if contact:
             try:
-                # If contact looks like whatsapp:+..., preserve; else normalize raw digits to whatsapp:+...
                 phone = normalize_phone_for_db(str(contact))
             except Exception:
-                # fallback: try simple prefix
+                # best-effort fallback
                 phone = f"whatsapp:{contact}" if not str(contact).startswith("whatsapp:") else contact
 
-        # ------------- DB: fetch existing payment if any -------------
-        existing = None
+        # --- Read existing DB row for this razorpay_payment_id (if any) ---
+        existing_map = None
         prev_status = None
         try:
             with get_conn() as conn, conn.cursor() as cur:
-                cur.execute("SELECT razorpay_payment_id, status, phone FROM payments WHERE razorpay_payment_id=%s LIMIT 1", (razorpay_payment_id,))
-                existing = cur.fetchone()
-                # convert to dict-like if RealDictCursor used, else leave as tuple
-                # We'll handle both cases below.
+                cur.execute(
+                    "SELECT razorpay_payment_id, status, phone FROM payments WHERE razorpay_payment_id = %s LIMIT 1",
+                    (razorpay_payment_id,)
+                )
+                existing = cur.fetchone()  # may be tuple or mapping
+                if existing:
+                    if hasattr(existing, "get"):  # mapping-like (RealDictRow)
+                        existing_map = dict(existing)
+                    else:
+                        # tuple-like: map columns by order selected above
+                        # existing -> (razorpay_payment_id, status, phone)
+                        existing_map = {
+                            "razorpay_payment_id": existing[0] if len(existing) > 0 else None,
+                            "status": existing[1] if len(existing) > 1 else None,
+                            "phone": existing[2] if len(existing) > 2 else None
+                        }
         except Exception as e:
-            print("handle_webhook_event: DB lookup failed:", e)
+            # don't fail the whole handler — log and continue
+            print("handle_webhook_event: DB lookup failed:", e, traceback.format_exc())
 
-        # Determine prev_status and possibly recover phone from existing DB row
-        if existing:
-            try:
-                # if existing is mapping-like
-                prev_status = (existing.get("status") or "").lower() if hasattr(existing, "get") else (existing[2].lower() if len(existing) > 2 and existing[2] else None)
-            except Exception:
-                prev_status = None
-            # if phone not known yet, try to use the payments table phone
-            if not phone:
-                try:
-                    phone = existing.get("phone") if hasattr(existing, "get") else (existing[1] if len(existing) > 1 else None)
-                except Exception:
-                    pass
+        if existing_map:
+            prev_status = (existing_map.get("status") or "").lower() if existing_map.get("status") else None
+            # recover phone from DB if not present
+            if not phone and existing_map.get("phone"):
+                phone = existing_map.get("phone")
 
-        # ------------- Upsert the payment (idempotent) using your record_payment helper -------------
+        # --- Upsert / record the payment in DB via your helper (idempotent) ---
+        latest_status = latest_status_in_payload or None
         try:
-            # record_payment should return something like (id, status) per your original code.
-            # Keep original signature (you used record_payment earlier). If record_payment returns different shape,
-            # adjust accordingly.
-            rec_id, latest_status_raw = record_payment(phone=phone, razorpay_payment_id=razorpay_payment_id, amount=amount, currency="INR", status=status)
-            latest_status = (latest_status_raw or status).lower()
+            # record_payment may return tuple (id, status) or a dict or None
+            rec = record_payment(
+                phone=phone,
+                razorpay_payment_id=razorpay_payment_id,
+                amount=amount,
+                currency=payment_entity.get("currency", "INR"),
+                status=latest_status_in_payload
+            )
+            # Normalize the return
+            if isinstance(rec, dict):
+                latest_status = (rec.get("status") or latest_status_in_payload or "").lower()
+            elif isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                latest_status = (rec[1] or latest_status_in_payload or "").lower()
+            else:
+                # if rec is scalar or None, fall back to payload
+                latest_status = (latest_status_in_payload or latest_status or "").lower()
         except Exception as e:
             print("handle_webhook_event: record_payment failed:", e, traceback.format_exc())
-            # fallback: use incoming status
-            latest_status = status
+            latest_status = (latest_status_in_payload or latest_status or "").lower()
 
-        # ------------- Decide whether to activate subscription -------------
-        paid_states = ("captured", "paid", "authorized")
+        # --- Decide if we should activate subscription (transition to paid/captured) ---
+        paid_states = {"captured", "paid", "authorized"}
         should_activate = False
-        if latest_status in paid_states:
-            # If prev_status is None or prev_status not in paid_states → activate now
-            if not prev_status or prev_status not in paid_states:
-                should_activate = True
+        try:
+            if latest_status in paid_states:
+                # only activate if previous state was not a paid state
+                if not prev_status or prev_status not in paid_states:
+                    should_activate = True
+        except Exception:
+            should_activate = False
 
         activated = False
+        activation_note = None
         if should_activate and phone:
             try:
-                # set_subscription_active should be idempotent (create or update)
-                # Ensure it uses normalized phone inside
                 set_subscription_active(phone, days=30)
                 activated = True
-                print("handle_webhook_event: subscription activated for", phone)
+                activation_note = "subscription activated"
             except Exception as e:
+                activation_note = f"activation failed: {e}"
                 print("handle_webhook_event: set_subscription_active failed:", e, traceback.format_exc())
 
+        # Return a clear summary for logging & tests
         return {
-            "phone": phone,
+            "status": "ok",
+            "event": event,
             "razorpay_payment_id": razorpay_payment_id,
             "prev_status": prev_status,
             "latest_status": latest_status,
-            "activated": activated
+            "activated": activated,
+            "note": activation_note
         }
 
     except Exception as e:
