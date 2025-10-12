@@ -1,6 +1,62 @@
 # utils.py
 import re
 from datetime import datetime, timezone
+import os
+from urllib.parse import urlparse, unquote
+
+# map common content-types to extensions
+_CONTENT_TYPE_TO_EXT = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/mp4": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/webm": ".webm",
+    "video/mp4": ".mp4",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "application/pdf": ".pdf",
+}
+
+def get_ext_from_content_type(content_type: str) -> str | None:
+    """
+    Return a file extension (including the dot) for a Content-Type header,
+    or None if unknown.
+    Example: 'audio/m4a' -> '.m4a'
+    """
+    if not content_type:
+        return None
+    # sometimes content_type has charset like 'audio/mpeg; charset=utf-8'
+    ct = content_type.split(";")[0].strip().lower()
+    return _CONTENT_TYPE_TO_EXT.get(ct)
+
+def safe_filename_from_url(url: str, fallback_ext: str = ".bin") -> str:
+    """
+    Build a safe filename from a URL path + extension inference.
+    Returns a filename like 'downloaded_abcdef.m4a' or 'downloaded.bin' if unknown.
+    """
+    if not url:
+        # caller should handle None earlier
+        return f"downloaded{fallback_ext}"
+
+    try:
+        parsed = urlparse(unquote(url))
+        basename = os.path.basename(parsed.path) or ""
+        # keep only safe chars
+        basename = re.sub(r'[^A-Za-z0-9_.-]', '_', basename)
+        name, ext = os.path.splitext(basename)
+        if ext:
+            return f"{name}{ext}"
+        # try to infer from query parameters (e.g., ?format=m4a)
+        query = parsed.query or ""
+        m = re.search(r"(?:format|type)=([a-z0-9]+)", query, flags=re.I)
+        if m:
+            return f"{name}.{m.group(1)}"
+    except Exception:
+        pass
+    return f"downloaded{fallback_ext}"
 
 def normalize_phone_for_db(raw_phone: str) -> str:
     """
