@@ -76,6 +76,8 @@ def init_db():
         );
         """)
 
+    
+
         # Payments table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -102,6 +104,20 @@ def init_db():
             summary TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         );
+        """)
+
+        # Ensure message_sid column exists for deduping incoming media (used by app.py)
+        cur.execute("ALTER TABLE meeting_notes ADD COLUMN IF NOT EXISTS message_sid TEXT;")
+
+        # Optional: create index for quick lookup + dedupe enforcement (not strictly UNIQUE because some rows may be null)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_meeting_notes_message_sid ON meeting_notes (message_sid);")
+
+        # If you want to enforce uniqueness for non-null message_sid values (strong dedupe),
+        # create a unique partial index:
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_meeting_notes_message_sid_unique
+            ON meeting_notes (message_sid)
+            WHERE message_sid IS NOT NULL;
         """)
 
 
