@@ -21,7 +21,9 @@ import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from twilio.rest import Client as TwilioClient
-from mutagen import File as MutagenFile  # keep mutagen for exact duration
+from mutagen import File as MutagenFile  # keep mutagen for exact duration 
+from utils import send_whatsapp
+
 
 # Import your local DB and payments helpers (these must exist in your repo)
 # db.py should expose: init_db, get_conn, get_or_create_user, get_remaining_minutes, deduct_minutes,
