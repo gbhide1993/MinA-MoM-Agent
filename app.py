@@ -579,15 +579,43 @@ def twilio_webhook():
                 to_deduct = minutes
 
             if to_deduct > 0 and credits_remaining < to_deduct:
-                # Not enough credits
+                # Not enough credits: create Razorpay payment link and send it
                 conn.rollback()
-                send_whatsapp(phone, "⚠️ You have insufficient free minutes. Please subscribe to continue: <link>")
+                try:
+                    # Decide how much to charge — simplest: full subscription price (e.g., 30 minutes)
+                    # Option A: charge flat subscription amount (recommended for simplicity)
+                    SUBSCRIPTION_PRICE_RUPEES = float(os.getenv("SUBSCRIPTION_PRICE_RUPEES", "499.0"))
+
+                    # Option B (alternative): charge pro-rata based on minutes_needed. Uncomment to use.
+                    # price_per_min = float(os.getenv("PRICE_PER_MIN_RUPEE", "2.0"))
+                    # amount_needed = round((to_deduct - credits_remaining) * price_per_min, 2)
+
+                    # We'll generate a payment link for the subscription price so user gets full 30 minutes on capture.
+                    payment = create_payment_link_for_phone(phone, SUBSCRIPTION_PRICE_RUPEES)
+                    order_id = payment.get("order_id") or payment.get("order", {}).get("id")
+                    # Construct a human-friendly link — Razorpay has hosted payment pages; often client builds it using order id.
+                    # The function returns order object — you can persist and use it. For now, send the order id and reference.
+                    if payment and payment.get("order"):
+                        # If SDK returns 'order' with 'id' or 'short_url' (if using payment link API) use that
+                        url = payment.get("order").get("short_url") if payment.get("order").get("short_url") else f"{os.getenv('PLATFORM_URL','')}/pay?order_id={order_id}"
+                    else:
+                        url = f"{os.getenv('PLATFORM_URL','')}/pay?order_id={order_id}"
+
+                    send_whatsapp(phone, (
+                        "⚠️ You don’t have enough free minutes to transcribe this audio. "
+                        "Top up to continue — follow this secure payment link:\n\n" + url
+                    ))
+                except Exception as e:
+                    debug_print("Failed to create/send payment link:", e, traceback.format_exc())
+                    send_whatsapp(phone, "⚠️ You have insufficient free minutes. Please visit the app to subscribe.")
                 return ("", 204)
+
 
             # Deduct credits if needed
             if to_deduct > 0:
                 new_credits = credits_remaining - to_deduct
                 cur.execute("UPDATE users SET credits_remaining=%s WHERE phone=%s", (new_credits, phone))
+                
             # Insert meeting row with message_sid = dedupe_key
             cur.execute("""
                 INSERT INTO meeting_notes (phone, audio_file, transcript, summary, message_sid, created_at)
@@ -607,6 +635,22 @@ def twilio_webhook():
                 conn.rollback()
                 raise RuntimeError("Failed to read meeting id after insert")
             conn.commit()
+
+                # 🧩 NEW BLOCK: Send payment link if balance is zero
+            try:
+                from db import get_user_credits
+                credits_remaining = get_user_credits(phone)
+            except Exception:
+                credits_remaining = None
+
+            if credits_remaining is not None and credits_remaining <= 0.0:
+                from payments import create_payment_link_for_phone
+                from utils import send_whatsapp
+                amount = float(os.getenv("SUBSCRIPTION_PRICE_RUPEES", "99.0"))
+                payment = create_payment_link_for_phone(phone, amount)
+                url = payment.get("order", {}).get("short_url") or f"{os.getenv('PLATFORM_URL','')}/pay?order_id={payment.get('order', {}).get('id')}"
+                send_whatsapp(phone, f"ℹ️ You've used your free minutes. Top up here: {url}")
+
 
         # Now transcribe & summarize outside transaction (or you can transcribe before the transaction and include in insert)
         transcript = transcribe_audio_local_file(local_path)  # your function
