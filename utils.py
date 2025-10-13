@@ -3,6 +3,8 @@ import re
 from datetime import datetime, timezone
 import os
 from urllib.parse import urlparse, unquote
+from twilio.rest import Client as TwilioClient
+
 
 # map common content-types to extensions
 _CONTENT_TYPE_TO_EXT = {
@@ -94,3 +96,42 @@ def normalize_phone_for_db(raw_phone: str) -> str:
 def now_utc():
     """Return current UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+
+def send_whatsapp(to_phone: str, message: str):
+    """
+    Send a WhatsApp message using Twilio API.
+
+    Args:
+        to_phone (str): Recipient's WhatsApp phone number (e.g. +919876543210)
+        message (str): Text message to send
+    """
+    try:
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        from_whatsapp_number = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")  # Twilio sandbox default
+
+        if not account_sid or not auth_token:
+            print("⚠️ Missing Twilio credentials in environment.")
+            return False
+
+        client = TwilioClient(account_sid, auth_token)
+
+
+        to_whatsapp_number = (
+            f"whatsapp:{to_phone}" if not to_phone.startswith("whatsapp:") else to_phone
+        )
+
+        message = client.messages.create(
+            from_=from_whatsapp_number,
+            body=message,
+            to=to_whatsapp_number
+        )
+
+        print(f"✅ WhatsApp message sent to {to_phone}, SID: {message.sid}")
+        return True
+
+    except Exception as e:
+        print(f"❌ Failed to send WhatsApp message to {to_phone}: {e}")
+        return False
