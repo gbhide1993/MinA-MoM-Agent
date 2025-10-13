@@ -647,7 +647,7 @@ def twilio_webhook():
 
             if credits_remaining is not None and credits_remaining <= 0.0:
                 from payments import create_payment_link_for_phone
-                from utils import send_whatsapp
+                
                 amount = float(os.getenv("SUBSCRIPTION_PRICE_RUPEES", "99.0"))
                 payment = create_payment_link_for_phone(phone, amount)
                 url = payment.get("order", {}).get("short_url") or f"{os.getenv('PLATFORM_URL','')}/pay?order_id={payment.get('order', {}).get('id')}"
@@ -811,6 +811,7 @@ if __name__ == "__main__":
     debug_print("Starting Flask app (FLASK_DEBUG=%s) on port %s" % (flask_debug, os.getenv("PORT", "5000")))
     # Always bind to 0.0.0.0 so Render/local dev can reach it
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=flask_debug)
+
 
 
 
