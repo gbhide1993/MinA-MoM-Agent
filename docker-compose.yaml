@@ -1,0 +1,72 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mina}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-minapw}
+      POSTGRES_DB: ${POSTGRES_DB:-minadb}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - mina-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mina} -d ${POSTGRES_DB:-minadb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    networks:
+      - mina-net
+    #ports:
+      #- "6379:6379"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./:/app:cached
+    ports:
+      - "5000:5000"
+    networks:
+      - mina-net
+    command: >
+      gunicorn app:app --bind 0.0.0.0:5000 --workers 3 --worker-class gthread
+
+  rq-worker:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./:/app:cached
+    networks:
+      - mina-net
+    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} default
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  mina-net:
+    driver: bridge
