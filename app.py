@@ -24,8 +24,7 @@ from twilio.rest import Client as TwilioClient
 from mutagen import File as MutagenFile  # keep mutagen for exact duration 
 from utils import send_whatsapp
 from openai_client import transcribe_file, summarize_text
-from redis import Redis
-from rq import Queue
+from redis_conn import redis_conn, queue
 
 
 # Import your local DB and payments helpers (these must exist in your repo)
@@ -449,16 +448,9 @@ def twilio_webhook():
 
 
         # --- ENQUEUE RQ JOB (asynchronous processing) ---
-        # Use Redis URL from env or default to redis service defined in docker-compose
-        REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-
+        # Use centralized redis_conn and queue from redis_conn.py
         try:
-            redis_conn = Redis.from_url(REDIS_URL)
-            q = Queue("default", connection=redis_conn)
-            # Enqueue the background job. Use the module: function path for the worker to import.
-            # If you moved the task to repo root as process_meeting_task.py use "process_meeting_task.process_meeting"
-            # If you still have it named process_meeting in root adjust accordingly.
-            job = q.enqueue(
+            job = queue.enqueue(
                 "process_meeting_task.process_meeting",   # module.function
                 meeting_id,                               # first arg: meeting id in DB
                 media_url,                                # second arg: the media URL (optional)
