@@ -15,7 +15,10 @@ from utils import (
 from openai_client import transcribe_file, summarize_text
 
 # Config
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+REDIS_URL = os.getenv("REDIS_URL")
+if not REDIS_URL:
+    raise RuntimeError("REDIS_URL environment variable is not set. Set REDIS_URL to your Redis connection string.")
+
 SUMMARIZE_INSTRUCTIONS = os.getenv(
     "SUMMARIZE_INSTRUCTIONS",
     "Extract TL;DR, action items, decisions. Return JSON or short bullet format."
