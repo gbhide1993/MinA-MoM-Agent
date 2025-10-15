@@ -23,6 +23,9 @@ from dotenv import load_dotenv
 from twilio.rest import Client as TwilioClient
 from mutagen import File as MutagenFile  # keep mutagen for exact duration 
 from utils import send_whatsapp
+from openai_client import transcribe_file, summarize_text
+from redis import Redis
+from rq import Queue
 
 
 # Import your local DB and payments helpers (these must exist in your repo)
@@ -76,22 +79,6 @@ def debug_print(*args, **kwargs):
     print(*args, **kwargs)
 
 
-def send_whatsapp(to_whatsapp: str, body: str):
-    """
-    Send a WhatsApp message via Twilio. to_whatsapp should be full e.g. 'whatsapp:+919xxxx'
-    This function logs errors instead of raising so webhook doesn't crash.
-    """
-    global twilio_client, TWILIO_WHATSAPP_FROM
-    if not twilio_client or not TWILIO_WHATSAPP_FROM:
-        debug_print("Twilio client or TWILIO_WHATSAPP_FROM not configured. Message intended:", to_whatsapp, body[:200])
-        return None
-    try:
-        msg = twilio_client.messages.create(body=body, from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp)
-        debug_print("Twilio message sent:", msg.sid)
-        return msg.sid
-    except Exception as e:
-        debug_print("Twilio send failed:", e)
-        return None
 
 
 def _ext_from_content_type(ct: str):
@@ -177,161 +164,8 @@ def get_audio_duration_seconds(path: str) -> float:
             return 60.0  # worst-case fallback 1 minute
 
 
-def transcribe_audio(file_path: str, language: str = None, attempts: int = 2) -> str:
-    """
-    Robust transcription wrapper for OpenAI Whisper (HTTP endpoint).
-    - Guesses MIME type and sends file.
-    - If Whisper returns 400 invalid file format, it retries with a different MIME mapping once.
-    - Raises Exception on final failure.
-    """
-    if language is None:
-        language = LANGUAGE
-
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set")
-
-    url = "https://api.openai.com/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-
-    # try to guess mime from extension
-    guessed_mime, _ = mimetypes.guess_type(file_path)
-    guessed_mime = guessed_mime or ""
-    # normalize a few common suspects
-    ext = os.path.splitext(file_path)[1].lower()
-    ext_to_mime = {
-        ".m4a": "audio/mp4",
-        ".mp4": "audio/mp4",
-        ".mp3": "audio/mpeg",
-        ".wav": "audio/wav",
-        ".ogg": "audio/ogg",
-        ".webm": "audio/webm",
-        ".opus": "audio/opus",
-    }
-    if not guessed_mime and ext in ext_to_mime:
-        guessed_mime = ext_to_mime[ext]
-
-    # Attempt loop: initial guessed mime, then fallback mapping if needed
-    last_err = None
-    tried = 0
-    tried_mimes = []
-
-    while tried < attempts:
-        mime_to_send = guessed_mime if tried == 0 else ext_to_mime.get(ext, guessed_mime or "audio/m4a")
-        tried += 1
-        tried_mimes.append(mime_to_send)
-        try:
-            with open(file_path, "rb") as fh:
-                files = {
-                    "file": (os.path.basename(file_path), fh, mime_to_send)
-                }
-                data = {"model": "whisper-1"}
-                if language:
-                    data["language"] = language
-                resp = requests.post(url, headers=headers, data=data, files=files, timeout=120)
-            # success
-            if resp.status_code == 200:
-                # many times resp is JSON { "text": "..." } or string; try both
-                try:
-                    dj = resp.json()
-                    text = dj.get("text") or (dj.get("transcription") if isinstance(dj, dict) else None)
-                    if text is None:
-                        # some API shapes return {'text': '...'}
-                        text = dj if isinstance(dj, str) else None
-                    if text is None:
-                        # last attempt: treat whole body as text
-                        text = resp.text
-                except Exception:
-                    text = resp.text
-                return text.strip()
-            # If it's clearly invalid file format, try fallback and retry
-            if resp.status_code == 400 and "Invalid file format" in resp.text:
-                last_err = RuntimeError(f"Whisper invalid file format: {resp.text}")
-                debug_print("transcribe_audio: Whisper invalid file format (will retry with other mime)", resp.text[:400])
-                continue
-            # other errors: bubble up
-            last_err = RuntimeError(f"Transcription failed: {resp.status_code} {resp.text}")
-            debug_print("transcribe_audio: non-400 error from Whisper:", resp.status_code, resp.text[:400])
-            break
-        except Exception as e:
-            last_err = e
-            debug_print("transcribe_audio: exception while calling OpenAI:", e, traceback.format_exc())
-            # continue to retry if attempts left
-            continue
-
-    # if we reach here, we failed
-    debug_print("transcribe_audio: attempts exhausted. tried mimes:", tried_mimes)
-    raise last_err if last_err else RuntimeError("transcribe_audio: unknown error")
 
 
-def call_llm_for_minutes_and_bullets(transcript: str) -> dict:
-    """
-    Call LLM (OpenAI chat/completion) to produce structured minutes and bullets.
-    Uses 'gpt-4o-mini' / '4o-mini' if available, or classic GPT-4o endpoints depending on your setup.
-    Returns a dict with 'summary' and 'bullets' keys.
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not configured")
-
-    endpoint = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-
-    # A compact, instructive prompt to produce structured output
-    system_prompt = (
-        "You are MinA — an assistant that turns meeting audio transcripts into structured meeting minutes. "
-        "Return a JSON object with 'summary' (2-3 sentence summary), 'bullets' (list of key points/action-items), "
-        "and 'participants' (if mentioned). Keep results factual and concise."
-    )
-    user_content = f"Transcript:\n{transcript}\n\nProduce JSON only."
-
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 800,
-    }
-
-    try:
-        resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-        if resp.status_code != 200:
-            debug_print("LLM call failed:", resp.status_code, resp.text[:400])
-            raise RuntimeError(f"LLM call failed: {resp.status_code} {resp.text}")
-        j = resp.json()
-        # Extract text from the assistant's message
-        choices = j.get("choices", [])
-        if not choices:
-            raise RuntimeError("LLM returned no choices")
-        message = choices[0].get("message", {}).get("content", "")
-        # The model may return JSON or plain text — try to parse JSON out
-        parsed = None
-        try:
-            parsed = json.loads(message)
-        except Exception:
-            # Attempt to extract JSON substring
-            try:
-                start = message.find("{")
-                end = message.rfind("}") + 1
-                if start != -1 and end != -1:
-                    sub = message[start:end]
-                    parsed = json.loads(sub)
-            except Exception:
-                parsed = None
-        if parsed is None:
-            # fallback: return flat summary and bullets by splitting lines
-            lines = [l.strip() for l in message.splitlines() if l.strip()]
-            summary = lines[0] if lines else ""
-            bullets = lines[1:] if len(lines) > 1 else []
-            return {"summary": summary, "bullets": bullets}
-        # ensure keys
-        summary = parsed.get("summary") or parsed.get("summary_text") or ""
-        bullets = parsed.get("bullets") or parsed.get("items") or []
-        participants = parsed.get("participants") or []
-        return {"summary": summary, "bullets": bullets, "participants": participants}
-    except Exception as e:
-        debug_print("call_llm_for_minutes_and_bullets: error", e, traceback.format_exc())
-        raise
 
 
 def format_minutes_for_whatsapp(result: dict) -> str:
@@ -415,50 +249,8 @@ def compute_audio_duration_seconds(file_path):
         return 0.0
 
 
-def transcribe_audio_local_file(file_path):
-    """Transcribe the given local audio file using OpenAI Whisper."""
-    try:
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-        with open(file_path, "rb") as audio_file:
-            response = openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
-        transcript = response.text.strip()
-        print("✅ Transcription success (first 100 chars):", transcript[:100])
-        return transcript
-    except Exception as e:
-        print("❌ Transcription failed:", e)
-        raise RuntimeError(f"Transcription failed: {e}")
 
 
-def call_llm_summarize(text):
-    """Summarize and structure the meeting into readable bullet points."""
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    prompt = f"""
-    You are MinA, an AI meeting summarizer. 
-    Summarize the following transcript in 5-8 crisp, structured bullet points with clarity and brevity.
-    Focus on:
-    - Key discussion points
-    - Decisions made
-    - Action items
-    - Deadlines or follow-ups if any
-    
-    Transcript:
-    {text}
-    """
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.4,
-        )
-        summary = response.choices[0].message.content.strip()
-        print("✅ LLM Summary generated (first 100 chars):", summary[:100])
-        return summary
-    except Exception as e:
-        print("❌ LLM summarization failed:", e)
-        raise RuntimeError(f"LLM summarization failed: {e}")
 
 
 def format_summary_for_whatsapp(summary_text):
@@ -648,23 +440,40 @@ def twilio_webhook():
             if credits_remaining is not None and credits_remaining <= 0.0:
                 from payments import create_payment_link_for_phone
                 
-                amount = float(os.getenv("SUBSCRIPTION_PRICE_RUPEES", "99.0"))
+                amount = float(os.getenv("SUBSCRIPTION_PRICE_RUPEES", "499.0"))
                 payment = create_payment_link_for_phone(phone, amount)
                 url = payment.get("order", {}).get("short_url") or f"{os.getenv('PLATFORM_URL','')}/pay?order_id={payment.get('order', {}).get('id')}"
                 send_whatsapp(phone, f"ℹ️ You've used your free minutes. Top up here: {url}")
 
 
-        # Now transcribe & summarize outside transaction (or you can transcribe before the transaction and include in insert)
-        transcript = transcribe_audio_local_file(local_path)  # your function
-        summary_text = call_llm_summarize(transcript)
 
-        # Update the meeting_notes row with transcript and summary
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute("UPDATE meeting_notes SET transcript=%s, summary=%s WHERE id=%s", (transcript, summary_text, meeting_id))
-            conn.commit()
 
-        # Reply to user
-        send_whatsapp(phone, format_summary_for_whatsapp(summary_text))
+        # --- ENQUEUE RQ JOB (asynchronous processing) ---
+        # Use Redis URL from env or default to redis service defined in docker-compose
+        REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+        try:
+            redis_conn = Redis.from_url(REDIS_URL)
+            q = Queue("default", connection=redis_conn)
+            # Enqueue the background job. Use the module: function path for the worker to import.
+            # If you moved the task to repo root as process_meeting_task.py use "process_meeting_task.process_meeting"
+            # If you still have it named process_meeting in root adjust accordingly.
+            job = q.enqueue(
+                "process_meeting_task.process_meeting",   # module.function
+                meeting_id,                               # first arg: meeting id in DB
+                media_url,                                # second arg: the media URL (optional)
+                job_timeout=60 * 60,                      # allow up to 1 hour for long files
+                result_ttl=60 * 60
+            )
+            debug_print(f"Enqueued RQ job {job.id} for meeting_id={meeting_id}")
+        except Exception as e:
+            debug_print("Failed to enqueue RQ job:", e)
+            # Inform user that async processing couldn't start (best-effort)
+            try:
+                send_whatsapp(phone, "⚠️ We couldn't start background processing for your audio. Please try again in a moment.")
+            except Exception:
+                pass
+        # End enqueue block. Worker will transcribe, summarize, update DB and reply.
 
         return ("", 204)
 
@@ -811,7 +620,6 @@ if __name__ == "__main__":
     debug_print("Starting Flask app (FLASK_DEBUG=%s) on port %s" % (flask_debug, os.getenv("PORT", "5000")))
     # Always bind to 0.0.0.0 so Render/local dev can reach it
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=flask_debug)
-
 
 
 
