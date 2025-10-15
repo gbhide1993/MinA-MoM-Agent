@@ -7,3 +7,5 @@ mutagen
 razorpay
 gunicorn
 openai>=1.10.0
+redis==5.0.11
+rq==1.13.0
