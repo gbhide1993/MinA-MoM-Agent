@@ -1,0 +1,53 @@
+# Render manifest for twilio-wa-mom
+# Defines one web service (Flask) and one background worker (RQ).
+services:
+  - type: web
+    name: twilio-wa-mom-web
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: starter
+    autoDeploy: true
+    startCommand: "./start.sh"
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: PORT
+        value: "8000"
+      - key: SECRET_KEY
+        fromSecret: SECRET_KEY
+      - key: DATABASE_URL
+        fromSecret: DATABASE_URL
+      - key: REDIS_URL
+        fromSecret: REDIS_URL
+      - key: TWILIO_ACCOUNT_SID
+        fromSecret: TWILIO_ACCOUNT_SID
+      - key: TWILIO_AUTH_TOKEN
+        fromSecret: TWILIO_AUTH_TOKEN
+      - key: TWILIO_WHATSAPP_NUMBER
+        fromSecret: TWILIO_WHATSAPP_NUMBER
+
+  - type: worker
+    name: twilio-wa-mom-worker
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: starter
+    autoDeploy: true
+    startCommand: "rq worker -u $REDIS_URL default"
+    envVars:
+      - key: REDIS_URL
+        fromSecret: REDIS_URL
+      - key: DATABASE_URL
+        fromSecret: DATABASE_URL
+      - key: TWILIO_ACCOUNT_SID
+        fromSecret: TWILIO_ACCOUNT_SID
+      - key: TWILIO_AUTH_TOKEN
+        fromSecret: TWILIO_AUTH_TOKEN
+
+# Optionally define secrets in this file, but it's safer to add them via the Render Dashboard.
+# secrets:
+#   - name: SECRET_KEY
+#   - name: DATABASE_URL
+#   - name: REDIS_URL
+#   - name: TWILIO_ACCOUNT_SID
+#   - name: TWILIO_AUTH_TOKEN
+#   - name: TWILIO_WHATSAPP_NUMBER
