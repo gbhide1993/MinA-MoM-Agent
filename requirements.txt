@@ -6,6 +6,6 @@ psycopg2-binary
 mutagen
 razorpay
 gunicorn
-openai>=1.10.0
-redis==5.3.1
-rq==1.13.0
+openai
+redis
+rq
