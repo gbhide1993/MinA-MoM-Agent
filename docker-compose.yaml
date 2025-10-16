@@ -1,4 +1,4 @@
-version: "3.8"
+
 
 services:
   postgres:
@@ -77,3 +77,4 @@ volumes:
 networks:
   mina-net:
     driver: bridge
+
