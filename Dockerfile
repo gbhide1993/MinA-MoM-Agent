@@ -9,16 +9,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy project files
-COPY . .
+# Install Python deps early (faster rebuilds). Ensure requirements.txt exists.
+COPY requirements.txt /app/requirements.txt
+RUN python -m pip install --upgrade pip \
+    && pip install --no-cache-dir -r /app/requirements.txt
 
-# Install dependencies: requirements.txt if present, and ensure rq + redis are installed
-RUN pip install --no-cache-dir -r requirements.txt || true \
-    && pip install --no-cache-dir rq redis
+# Copy project files after deps are installed
+COPY . /app
 
-ENV REDIS_URL=redis://host.docker.internal:6379/0
+# Make scripts executable if present (safe no-op if missing)
+RUN chmod +x /app/start.sh || true
+
 ENV PYTHONUNBUFFERED=1
 
-# Run RQ worker via python -m so it works even if console script not present
-CMD ["rq", "worker", "transcribe", "--url", "redis://redis:6379/0", "--verbose"]
-
+# Default: run rq worker. Use shell form so $REDIS_URL expands at runtime.
+# NOTE: use -u (or --url) with the REDIS_URL env var (do NOT pass --tls or redis-cli wrappers).
+CMD ["sh", "-c", "rq worker -u \"$REDIS_URL\" transcribe --verbose"]
