@@ -28,4 +28,4 @@ fi
 echo "Starting gunicorn with target=${TARGET} on port ${PORT} (workers=${WORKERS})"
 
 # Exec gunicorn via python -m to avoid path issues
-exec python -m gunicorn "$TARGET" -w "$WORKERS" -b "0.0.0.0:${PORT}" --timeout "$TIMEOUT" --log-level info
+exec python -m gunicorn "$TARGET" -w "$WORKERS" -b "0.0.0.0:${PORT:- 8080}" --timeout "$TIMEOUT" --log-level info
