@@ -24,4 +24,5 @@ ENV PYTHONUNBUFFERED=1
 
 # Default: run rq worker. Use shell form so $REDIS_URL expands at runtime.
 # NOTE: use -u (or --url) with the REDIS_URL env var (do NOT pass --tls or redis-cli wrappers).
-CMD ["sh", "-c", "rq worker -u \"$REDIS_URL\" transcribe --verbose"]
+CMD ["sh", "-c", "exec rq worker -u \"$REDIS_URL\" transcribe --verbose"]
+
